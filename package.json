@@ -1,0 +1,56 @@
+{
+  "name": "nfticket",
+  "version": "0.1.0",
+  "description": "Open-source NFT ticketing on Solana",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "install:all": "npm install && npm run install:shared && npm run install:provider && npm run install:app",
+    "install:shared": "cd apps/shared && npm install",
+    "install:provider": "cd apps/provider && npm install",
+    "install:app": "cd apps/app && npm install",
+    "dev": "concurrently \"npm run dev:provider\" \"npm run dev:app\"",
+    "dev:provider": "cd apps/provider && npm run dev",
+    "dev:app": "cd apps/app && npm run dev",
+    "build": "npm run build:shared && npm run build:provider && npm run build:app",
+    "build:shared": "cd apps/shared && npm run build || true",
+    "build:provider": "cd apps/provider && npm run build",
+    "build:app": "cd apps/app && npm run build",
+    "test": "npm run test:program && npm run test:apps",
+    "test:program": "cd anchor-program && anchor test",
+    "test:apps": "cd apps/provider && npm test && cd ../app && npm test",
+    "lint": "eslint apps/ --ext .ts,.tsx",
+    "format": "prettier --write \"apps/**/*.{ts,tsx,js,jsx,json,css}\"",
+    "anchor:build": "cd anchor-program && anchor build",
+    "anchor:test": "cd anchor-program && anchor test",
+    "anchor:deploy": "cd anchor-program && anchor deploy"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/nfticket.git"
+  },
+  "keywords": [
+    "solana",
+    "nft",
+    "ticketing",
+    "blockchain",
+    "anchor",
+    "web3",
+    "events"
+  ],
+  "author": "NFTicket Contributors",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/yourusername/nfticket/issues"
+  },
+  "homepage": "https://github.com/yourusername/nfticket#readme",
+  "devDependencies": {
+    "concurrently": "^8.2.0",
+    "eslint": "^8.56.0",
+    "prettier": "^3.2.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0"
+  }
+}
