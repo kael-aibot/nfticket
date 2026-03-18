@@ -3,6 +3,8 @@ use anchor_lang::prelude::*;
 // Program ID (placeholder - will be generated)
 declare_id!("NFTicket111111111111111111111111111111111111");
 
+const MAX_SCANNERS: usize = 50;
+
 #[program]
 pub mod nfticket {
     use super::*;
@@ -193,9 +195,72 @@ pub mod nfticket {
             !event.authorized_scanners.contains(&scanner),
             ErrorCode::ScannerAlreadyExists
         );
+        require!(
+            event.authorized_scanners.len() < MAX_SCANNERS,
+            ErrorCode::MaxScannersReached
+        );
 
         event.authorized_scanners.push(scanner);
         msg!("Scanner authorized: {}", scanner);
+        Ok(())
+    }
+
+    /// Cancel a resale listing
+    pub fn cancel_resale_listing(ctx: Context<ListTicketForResale>) -> Result<()> {
+        let ticket = &mut ctx.accounts.ticket;
+
+        require!(
+            ticket.owner == ctx.accounts.seller.key(),
+            ErrorCode::NotTicketOwner
+        );
+        require!(ticket.is_for_sale, ErrorCode::TicketNotForSale);
+
+        ticket.is_for_sale = false;
+        ticket.sale_price = None;
+
+        msg!("Ticket resale listing cancelled");
+        Ok(())
+    }
+
+    /// Close/archive an event
+    pub fn close_event(ctx: Context<ManageScanners>) -> Result<()> {
+        let event = &mut ctx.accounts.event;
+
+        event.is_active = false;
+        msg!("Event closed: {}", event.name);
+        Ok(())
+    }
+
+    /// Remove an authorized scanner
+    pub fn remove_scanner(ctx: Context<ManageScanners>, scanner: Pubkey) -> Result<()> {
+        let event = &mut ctx.accounts.event;
+        let original_len = event.authorized_scanners.len();
+
+        event.authorized_scanners.retain(|authorized| authorized != &scanner);
+
+        require!(
+            event.authorized_scanners.len() != original_len,
+            ErrorCode::ScannerNotFound
+        );
+
+        msg!("Scanner removed: {}", scanner);
+        Ok(())
+    }
+
+    /// Staff override to invalidate a ticket
+    pub fn invalidate_ticket(ctx: Context<InvalidateTicket>) -> Result<()> {
+        let event = &ctx.accounts.event;
+        let ticket = &mut ctx.accounts.ticket;
+
+        require!(ticket.event_id == event.key(), ErrorCode::TicketEventMismatch);
+        require!(
+            !matches!(ticket.scan_status, ScanStatus::Invalidated),
+            ErrorCode::TicketAlreadyInvalidated
+        );
+
+        ticket.scan_status = ScanStatus::Invalidated;
+
+        msg!("Ticket invalidated");
         Ok(())
     }
 }
@@ -265,12 +330,15 @@ pub struct Ticket {
     pub resale_count: u8,
     pub resale_history: Vec<ResaleRecord>,
     pub is_for_sale: bool,
-    pub sale_price: Option<64>,
+    pub sale_price: Option<u64>,
 }
 
 // Contexts
 #[derive(Accounts)]
 pub struct CreateEvent<'info> {
+    // Dynamic account sizing placeholder. Replace `1000` with a full calculation
+    // covering discriminator + fixed fields + max string lengths + max tier entries
+    // + `MAX_SCANNERS * 32` bytes for `authorized_scanners`.
     #[account(init, payer = organizer, space = 8 + 1000)]
     pub event: Account<'info, Event>,
     #[account(mut)]
@@ -320,6 +388,15 @@ pub struct ScanTicket<'info> {
 pub struct ManageScanners<'info> {
     #[account(mut, has_one = organizer)]
     pub event: Account<'info, Event>,
+    pub organizer: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InvalidateTicket<'info> {
+    #[account(has_one = organizer)]
+    pub event: Account<'info, Event>,
+    #[account(mut)]
+    pub ticket: Account<'info, Ticket>,
     pub organizer: Signer<'info>,
 }
 
@@ -381,4 +458,10 @@ pub enum ErrorCode {
     UnauthorizedScanner,
     #[msg("Scanner already exists")]
     ScannerAlreadyExists,
+    #[msg("Maximum number of scanners reached")]
+    MaxScannersReached,
+    #[msg("Scanner not found")]
+    ScannerNotFound,
+    #[msg("Ticket already invalidated")]
+    TicketAlreadyInvalidated,
 }
