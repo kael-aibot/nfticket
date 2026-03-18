@@ -1,205 +1,158 @@
 # NFTicket
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Solana](https://img.shields.io/badge/Solana-Devnet-purple)](https://solana.com)
-[![Anchor](https://img.shields.io/badge/Anchor-0.29-blue)](https://anchor-lang.com)
+[![Prototype](https://img.shields.io/badge/Status-Product%20Prototype-orange)](#current-status)
+[![Anchor](https://img.shields.io/badge/Anchor-Partial-blue)](#architecture-overview)
 
-**Open-source NFT ticketing on Solana** — eliminating fraud, enabling transparent pricing, and solving the resale problem through programmable royalty splits.
+**NFTicket is a strong product prototype for modern ticketing flows on Solana-inspired rails.** The repository already includes polished buyer and organizer demos, solid pricing and resale domain modeling, and real QR scanning UX. It does **not** yet deliver a production-ready on-chain ticketing system.
 
 ![NFTicket Banner](docs/banner.png)
 
-## ✨ Features
+## Current Status
 
-- **🎫 NFT Tickets** — Non-counterfeitable, verifiable on-chain
-- **💰 Transparent Pricing** — 2.5% platform fee, no hidden charges
-- **↔️ Smart Resale** — Time-decaying premiums + triple-split profit sharing
-- **📱 Mobile-First** — Dedicated apps for organizers and attendees
-- **🔒 Anti-Fraud** — QR code validation with on-chain verification
-- **⚡ Fast & Cheap** — Solana's low fees (~$0.01 per transaction)
+> [!WARNING]
+> **This repository is currently a sophisticated product prototype, not a production Solana system.**
+>
+> - The active apps are polished local demos with browser `localStorage` as the source of truth.
+> - Payments are simulated in the UI, not real Stripe, SOL, or USDC settlement flows.
+> - Ticket minting uses placeholder mint data, not real Metaplex NFT issuance.
+> - The Anchor program exists as a partial smart-contract foundation, but it is not integrated into the live app flows.
 
-## 🏗️ Architecture
+That said, the foundation is strong. The current implementation is useful for product demos, UX iteration, domain validation, and contributor onboarding into the target architecture.
 
-```
-nfticket/
-├── apps/
-│   ├── provider/          # Event organizer portal (Next.js)
-│   │   ├── pages/
-│   │   │   ├── index.tsx       # Dashboard
-│   │   │   ├── create.tsx      # Create events
-│   │   │   ├── events/[id].tsx # Event management
-│   │   │   └── scanner.tsx     # Ticket scanner
-│   │   └── package.json
-│   │
-│   └── app/               # Ticket buyer app (Next.js, mobile-first)
-│       ├── pages/
-│       │   ├── index.tsx       # Browse events
-│       │   └── my-tickets.tsx  # View & use tickets
-│       └── package.json
-│
-├── apps/shared/           # Shared hooks & types
-│   ├── hooks/useNfticket.ts
-│   └── idl/nfticket.json
-│
-├── anchor-program/        # Solana smart contract
-│   └── src/lib.rs
-│
-└── docs/                  # Documentation
-```
+## Features
 
-## 🚀 Quick Start
+### ✅ Implemented
+
+- Buyer mobile web app for browsing events and viewing tickets
+- Organizer dashboard for creating events, managing inventory, and running scans
+- Local-first ticket lifecycle flows backed by browser `localStorage`
+- Domain logic for pricing, resale caps, payout splits, fraud flags, and transfer rules
+- QR code generation plus real camera-based scanning UX in the provider app
+- Demo auth/session flows and wallet-connected UX for prototype scenarios
+
+### 🚧 Partial
+
+- Anchor program structure for events, tickets, resale listings, scanner authorization, and scan state transitions
+- Shared service/domain modules in `lib/` that model the intended production backend architecture
+- Prisma schema that describes a future persistent data model
+
+### ❌ Not Yet Implemented
+
+- Real on-chain ticket ownership as the active apps' source of truth
+- Real Stripe, SOL, or USDC payment processing and reconciliation
+- Real Metaplex NFT minting and metadata storage
+- Backend/API persistence replacing browser-local state
+- Authoritative scan validation against backend or chain state
+- Production auth, secure sessions, and operational tooling
+
+## Tech Stack
+
+### Wired Up Today
+
+- `Next.js 14` apps in `apps/app` and `apps/provider`
+- Shared TypeScript logic in `apps/shared`
+- Browser `localStorage` for demo persistence
+- `html5-qrcode` and `qrcode.react` for ticket QR flows
+- Solana wallet libraries for prototype wallet UX and future integration points
+
+### Present but Not Fully Wired Into Runtime
+
+- `anchor-program/` with a partial Rust + Anchor contract
+- `lib/` service/domain modules for payments, minting, fulfillment, marketplace rules, and operations
+- `prisma/schema.prisma` for future durable persistence
+
+### Planned Target Stack
+
+- Solana as the production settlement/ownership layer
+- Anchor for finalized on-chain ticketing logic
+- Metaplex for real NFT issuance
+- Prisma + database-backed APIs for durable off-chain state
+- Real fiat and crypto payment rails with reconciliation and retryable fulfillment
+
+## Architecture Overview
+
+- `apps/app/` = buyer mobile app. This is an active local demo that stores data in browser `localStorage`.
+- `apps/provider/` = organizer dashboard and scanner. This is also an active local demo backed by browser `localStorage`.
+- `apps/shared/` = shared frontend hooks, demo storage utilities, auth helpers, and UI/domain helpers used by the active apps.
+- `anchor-program/` = partial Anchor smart contract modeling the intended on-chain system, but not integrated into the running apps.
+- `lib/` = domain and service foundations for payments, fulfillment, resale, fraud controls, indexing, and operations. These modules are architectural groundwork, not the live runtime path.
+- `prisma/` = schema definitions only. There is no runtime database integration yet.
+
+## Getting Started
+
+The current project runs as a **local demo environment**. It is best used for exploring flows, validating UX, and iterating toward the production architecture.
 
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) 18+
-- [Rust](https://rustup.rs/) for Anchor
-- [Solana CLI](https://docs.solana.com/cli/install-solana-cli-tools)
-- [Anchor CLI](https://www.anchor-lang.com/docs/installation)
+- `npm`
 
-### 1. Clone the Repository
+Rust, Solana CLI, and Anchor are only needed if you want to inspect or build the partial smart contract separately.
 
-```bash
-git clone https://github.com/yourusername/nfticket.git
-cd nfticket
-```
-
-### 2. Install Dependencies
+### Install dependencies
 
 ```bash
-# Install shared dependencies
-cd apps/shared
-npm install
-cd ../..
-
-# Install provider app
-cd apps/provider
-npm install
-cd ../..
-
-# Install buyer app
-cd apps/app
-npm install
-cd ../..
+npm run install:all
 ```
 
-### 3. Configure Solana
+### Run the demo apps
 
 ```bash
-# Set to devnet for testing
-solana config set --url devnet
-
-# Generate a new keypair (or use existing)
-solana-keygen new --outfile ~/.config/solana/id.json
-
-# Airdrop SOL for testing
-solana airdrop 2
+npm run dev
 ```
 
-### 4. Build & Deploy the Program
+Then open:
+
+- Organizer dashboard: `http://localhost:3001`
+- Buyer app: `http://localhost:3002`
+
+### Important demo behavior
+
+- Data is stored per browser in `localStorage`
+- Refreshing or switching browsers can change what data you see
+- Payments, minting, and ownership are simulated
+- The apps are suitable for demos, not production operations
+
+### Optional: inspect the partial Anchor program
 
 ```bash
 cd anchor-program
 anchor build
-anchor deploy
-
-# Copy the new program ID to your apps
-# Update apps/shared/hooks/useNfticket.ts with the deployed program ID
 ```
 
-### 5. Run the Apps
+This contract is still incomplete and is not the source of truth for the active apps.
 
-```bash
-# Terminal 1: Provider Portal
-cd apps/provider
-npm run dev
-# Open http://localhost:3001
+## Documentation
 
-# Terminal 2: Buyer App
-cd apps/app
-npm run dev
-# Open http://localhost:3002
-```
+- [CODEX Evaluation](CODEX-EVALUATION.md) for the current-state assessment
+- [Implementation Roadmap](IMPLEMENTATION-ROADMAP.md) for the broader architecture direction
+- [Architecture Decisions](ARCHITECTURE-DECISIONS.md) for design rationale
+- [Architecture Notes](docs/ARCHITECTURE.md) for system documentation-in-progress
 
-## 📖 Documentation
+## Roadmap
 
-- **[Architecture Overview](docs/ARCHITECTURE.md)** — System design & data flow
-- **[Smart Contract](docs/CONTRACT.md)** — Anchor program documentation
-- **[Provider Guide](docs/PROVIDER.md)** — Event organizer setup
-- **[API Reference](docs/API.md)** — Program instruction reference
+The current implementation plan in [CODEX-EVALUATION.md](CODEX-EVALUATION.md) outlines a `Phase 0` alignment step plus nine delivery phases to move from prototype to a coherent production system:
 
-## 🎨 Screenshots
+1. **Phase 0:** Choose and document the real product path
+2. **Phase 1:** Restore build health and CI credibility
+3. **Phase 2:** Collapse the runtime onto one architecture
+4. **Phase 3:** Complete production auth
+5. **Phase 4:** Wire real payments and fulfillment
+6. **Phase 5:** Finish NFT issuance
+7. **Phase 6:** Complete and harden the Anchor program
+8. **Phase 7:** Make scanning authoritative
+9. **Phase 8:** Complete resale and payout flows
+10. **Phase 9:** Testing, observability, and launch readiness
 
-| Provider Dashboard | Create Event | Ticket Scanner |
-|-------------------|--------------|----------------|
-| ![Dashboard](docs/screenshots/dashboard.png) | ![Create](docs/screenshots/create.png) | ![Scanner](docs/screenshots/scanner.png) |
+The near-term priority is straightforward: make the prototype honest, stable, and easier to extend, then replace local demo infrastructure with durable backend, payment, and blockchain integrations.
 
-| Browse Events | My Tickets | QR Code |
-|---------------|------------|---------|
-| ![Browse](docs/screenshots/browse.png) | ![Tickets](docs/screenshots/tickets.png) | ![QR](docs/screenshots/qr.png) |
+## Contributing
 
-## 💡 How It Works
+Contributors should treat this repo as a prototype with strong product and domain foundations. The highest-value work is reducing the gap between the polished demo experience and the still-partial production architecture.
 
-### For Event Organizers
+Please see [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
 
-1. **Create Event** — Set name, date, venue, ticket tiers
-2. **Configure Resale** — Set time-decay curve & profit splits
-3. **Authorize Scanners** — Add staff wallets for entry validation
-4. **Track Sales** — Real-time revenue & attendance analytics
+## License
 
-### For Ticket Buyers
-
-1. **Browse Events** — Discover upcoming events
-2. **Purchase** — Buy with SOL/USDC, receive NFT ticket
-3. **Show QR** — Present at entry for scanning
-4. **Resell Fairly** — List on marketplace with enforced price limits
-
-### Smart Resale Algorithm
-
-As the event approaches, maximum resale premium **decreases**:
-
-| Time Until Event | Max Premium |
-|-----------------|-------------|
-| > 60 days | 50% above face |
-| 30-60 days | 30% above face |
-| 7-30 days | 15% above face |
-| < 7 days | 5% above face |
-| Day of event | Face value only |
-
-**Profit Split:** 40% original buyer, 40% organizer, 20% charity
-
-## 🛠️ Tech Stack
-
-- **Blockchain:** Solana
-- **Smart Contract:** Rust + Anchor Framework
-- **Frontend:** Next.js 14 + Tailwind CSS
-- **Web3:** Solana Web3.js + Wallet Adapter
-- **Storage:** Arweave/IPFS for NFT metadata
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📜 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [Solana Foundation](https://solana.org) for the amazing ecosystem
-- [Anchor Framework](https://anchor-lang.com) for making Solana development accessible
-- [Metaplex](https://metaplex.com) for NFT standards
-
-## 📧 Contact
-
-- Twitter: [@nfticket](https://twitter.com/nfticket)
-- Discord: [Join our community](https://discord.gg/nfticket)
-- Email: hello@nfticket.app
-
----
-
-**Made with ❤️ for the Solana community**
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
