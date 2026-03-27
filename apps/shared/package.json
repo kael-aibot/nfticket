@@ -2,8 +2,12 @@
   "name": "nfticket-shared",
   "version": "0.1.0",
   "private": true,
+  "scripts": {
+    "build": "tsc --noEmit -p tsconfig.json"
+  },
   "main": "index.ts",
   "dependencies": {
+    "@prisma/client": "^5.10.2",
     "@coral-xyz/anchor": "^0.29.0",
     "@solana/wallet-adapter-react": "^0.15.35",
     "@solana/wallet-adapter-react-ui": "^0.9.35",

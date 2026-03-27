@@ -43,6 +43,15 @@ npm run build
 - Follow the existing code style and formatting
 - Run `npm run lint` before committing
 - Run `npm run format` to auto-format code
+- **Mobile-first**: Design for mobile browsers first, then scale up
+
+### Mobile Testing
+
+- Test on iOS Safari and Android Chrome
+- Verify "Add to Home Screen" functionality
+- Check responsive layouts (375px, 768px, 1920px)
+- Ensure touch targets are ≥44px
+- Test QR scanner on real devices
 
 ### Commit Messages
 

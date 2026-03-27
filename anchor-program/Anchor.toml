@@ -1,0 +1,38 @@
+[features]
+seeds = false
+skip-lint = false
+
+# Deployment placeholder only. Keep these values aligned with
+# `anchor-program/src/lib.rs` and the pubkey from
+# `target/deploy/nfticket-keypair.json`.
+[programs.localnet]
+nfticket = "NFTicket111111111111111111111111111111111111"
+
+[programs.devnet]
+nfticket = "NFTicket111111111111111111111111111111111111"
+
+[programs.mainnet]
+nfticket = "NFTicket111111111111111111111111111111111111"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+[test]
+startup_wait = 10000
+
+[test.validator]
+bind_address = "0.0.0.0"
+url = "https://api.devnet.solana.com"
+ledger = ".anchor/test-ledger"
+rpc_port = 8899
+
+[toolchain]
+anchor_version = "0.29.0"
+solana_version = "1.17.0"

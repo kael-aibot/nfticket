@@ -11,10 +11,30 @@ This guide covers deploying NFTicket to production.
 
 ## 1. Deploy the Smart Contract
 
+The checked-in program ID is still a deployment placeholder:
+
+- `anchor-program/src/lib.rs`
+- `anchor-program/Anchor.toml`
+- Generated IDLs checked into `apps/shared/nfticket.json`, `apps/app/shared/nfticket.json`, `apps/app/shared/idl/nfticket.json`, `apps/provider/shared/nfticket.json`, and `apps/provider/shared/idl/nfticket.json`
+
+There is no committed real devnet/mainnet program ID in this repo. You must set the actual program ID during deployment.
+
 ### Build the Program
 
 ```bash
 cd anchor-program
+solana-keygen new --outfile target/deploy/nfticket-keypair.json --force
+solana address -k target/deploy/nfticket-keypair.json
+```
+
+Copy the pubkey output and replace the placeholder `NFTicket111111111111111111111111111111111111` in:
+
+- `anchor-program/src/lib.rs` in `declare_id!(...)`
+- `anchor-program/Anchor.toml` under `[programs.localnet]`, `[programs.devnet]`, and `[programs.mainnet]`
+
+Then build:
+
+```bash
 anchor build
 ```
 
@@ -26,9 +46,21 @@ solana airdrop 2  # Get devnet SOL
 anchor deploy
 ```
 
-Save the program ID output. Update:
-- `apps/shared/hooks/useNfticket.ts` — replace `PROGRAM_ID`
-- `anchor-program/programs/nfticket/src/lib.rs` — replace `declare_id!`
+After deployment, verify the deployed address matches the pubkey from `target/deploy/nfticket-keypair.json`:
+
+```bash
+solana address -k target/deploy/nfticket-keypair.json
+```
+
+Then sync generated artifacts:
+
+```bash
+cp target/idl/nfticket.json ../apps/shared/nfticket.json
+cp target/idl/nfticket.json ../apps/app/shared/nfticket.json
+cp target/idl/nfticket.json ../apps/app/shared/idl/nfticket.json
+cp target/idl/nfticket.json ../apps/provider/shared/nfticket.json
+cp target/idl/nfticket.json ../apps/provider/shared/idl/nfticket.json
+```
 
 ### Deploy to Mainnet (Production)
 
@@ -59,6 +91,9 @@ NEXT_PUBLIC_SOLANA_NETWORK=mainnet-beta
 NEXT_PUBLIC_SOLANA_RPC=https://api.mainnet-beta.solana.com
 NEXT_PUBLIC_PROGRAM_ID=your_program_id_here
 ```
+
+`NEXT_PUBLIC_PROGRAM_ID` should match the same deployed address used in `anchor-program/src/lib.rs` and `anchor-program/Anchor.toml`.
+The current `apps/shared/hooks/useNfticket.ts` implementation does not contain a hard-coded `PROGRAM_ID`, so this value is configuration for frontend/runtime integration rather than a source file replacement.
 
 ### Build for Production
 
@@ -119,7 +154,9 @@ Update `NEXT_PUBLIC_SOLANA_RPC` with your endpoint URL.
 
 ### Smart Contract
 - [ ] Program deployed successfully
-- [ ] Program ID updated in all apps
+- [ ] Placeholder replaced in `anchor-program/src/lib.rs`
+- [ ] Placeholder replaced in `anchor-program/Anchor.toml`
+- [ ] `NEXT_PUBLIC_PROGRAM_ID` set in frontend environments
 - [ ] IDL synchronized
 
 ### Provider Portal
@@ -179,6 +216,7 @@ All data is on-chain and backed by Solana's consensus. No off-chain backup neede
 
 **"Program not found"**
 - Check program ID is correct
+- Check `solana address -k target/deploy/nfticket-keypair.json` matches `declare_id!`
 - Verify RPC endpoint is working
 - Ensure you're on the right network (devnet/mainnet)
 

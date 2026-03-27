@@ -1,12 +1,26 @@
 # NFTicket
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Prototype](https://img.shields.io/badge/Status-Product%20Prototype-orange)](#current-status)
-[![Anchor](https://img.shields.io/badge/Anchor-Partial-blue)](#architecture-overview)
+[![Status](https://img.shields.io/badge/Status-Product%20Prototype-orange)](#current-status)
+[![Mobile Ready](https://img.shields.io/badge/Mobile-Ready-brightgreen)](#mobile-installation)
 
-**NFTicket is a strong product prototype for modern ticketing flows on Solana-inspired rails.** The repository already includes polished buyer and organizer demos, solid pricing and resale domain modeling, and real QR scanning UX. It does **not** yet deliver a production-ready on-chain ticketing system.
+**NFTicket is a mobile-first NFT ticketing platform for modern events on Solana-inspired rails.** The repository includes polished buyer and organizer web apps with real QR scanning UX, solid pricing and resale domain modeling, and a strong foundation for production deployment.
 
 ![NFTicket Banner](docs/banner.png)
+
+## 📱 Mobile Installation
+
+**NFTicket works directly in your mobile browser** - no app store needed!
+
+### Quick Setup (30 seconds)
+1. Open browser on your phone (Safari on iOS, Chrome on Android)
+2. Visit the deployed app URLs (see Deployment section)
+3. **Optional**: Add to Home Screen for app-like experience
+
+**iOS (Safari):** Share button → "Add to Home Screen"  
+**Android (Chrome):** Menu (⋮) → "Add to Home Screen"
+
+👉 **See full mobile guide:** [`MOBILE-QUICKSTART.md`](./MOBILE-QUICKSTART.md)
 
 ## Current Status
 
@@ -79,7 +93,42 @@ That said, the foundation is strong. The current implementation is useful for pr
 - `lib/` = domain and service foundations for payments, fulfillment, resale, fraud controls, indexing, and operations. These modules are architectural groundwork, not the live runtime path.
 - `prisma/` = schema definitions only. There is no runtime database integration yet.
 
-## Getting Started
+## 🌐 Deployment (Mobile Access)
+
+**For public use, deploy to a hosting platform:**
+
+### Recommended: Vercel (Free Tier)
+```bash
+# Install Vercel CLI
+npm install -g vercel
+
+# Deploy buyer app
+cd apps/app && vercel --prod
+
+# Deploy provider app  
+cd apps/provider && vercel --prod
+```
+
+### Alternative: Netlify
+```bash
+# Install Netlify CLI
+npm install -g netlify-cli
+
+# Deploy
+cd apps/app && netlify deploy --prod
+cd apps/provider && netlify deploy --prod
+```
+
+### Self-Hosted (Docker)
+```bash
+# Build and serve with Docker
+docker build -t nfticket-app -f apps/app/Dockerfile .
+docker build -t nfticket-provider -f apps/provider/Dockerfile .
+```
+
+---
+
+## 💻 Getting Started (Local Development)
 
 The current project runs as a **local demo environment**. It is best used for exploring flows, validating UX, and iterating toward the production architecture.
 
@@ -112,7 +161,27 @@ Then open:
 - Data is stored per browser in `localStorage`
 - Refreshing or switching browsers can change what data you see
 - Payments, minting, and ownership are simulated
-- The apps are suitable for demos, not production operations
+- **For production**: Deploy to Vercel/Netlify and configure environment variables
+
+### Environment Setup
+
+Copy `.env.example` to `.env` and configure:
+
+```bash
+cp .env.example .env
+```
+
+**Required for mobile deployment:**
+- `NEXT_PUBLIC_APP_URL` - Your deployed URL (e.g., `https://nfticket.vercel.app`)
+- `NEXT_PUBLIC_SOLANA_RPC_URL` - Solana RPC endpoint (devnet for testing)
+- `SESSION_SECRET` - Random 32+ character string
+
+**Optional:**
+- `SOLANA_PAYER_SECRET` - For on-chain minting (devnet only)
+- `STRIPE_*` keys - For credit card payments
+- `DATABASE_URL` - For persistent backend storage
+
+See `.env.example` for full configuration options.
 
 ### Optional: inspect the partial Anchor program
 
@@ -147,11 +216,43 @@ The current implementation plan in [CODEX-EVALUATION.md](CODEX-EVALUATION.md) ou
 
 The near-term priority is straightforward: make the prototype honest, stable, and easier to extend, then replace local demo infrastructure with durable backend, payment, and blockchain integrations.
 
+## 📱 Mobile Setup
+
+**For contributors working on mobile:**
+
+1. Clone and install: `npm run install:all`
+2. Run both apps: `npm run dev`
+3. Test on mobile device:
+   - Find your computer's IP: `ipconfig` (Windows) or `ifconfig` (macOS/Linux)
+   - Access from phone: `http://YOUR_IP:3002` (buyer) or `:3001` (provider)
+4. Test PWA "Add to Home Screen" functionality
+5. Verify responsive design at breakpoints: 375px (mobile), 768px (tablet), 1920px (desktop)
+
+**Mobile testing tools:**
+- Browser DevTools (Device Mode)
+- Real device testing (recommended)
+- E2E tests: `npm run test:e2e` (Playwright)
+
+See [`MOBILE-QUICKSTART.md`](./MOBILE-QUICKSTART.md) for end-user instructions.
+
+---
+
 ## Contributing
 
 Contributors should treat this repo as a prototype with strong product and domain foundations. The highest-value work is reducing the gap between the polished demo experience and the still-partial production architecture.
 
+**Mobile-first contributions welcome!** NFTicket is designed to work seamlessly on mobile browsers.
+
 Please see [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
+
+### Mobile Contribution Checklist
+
+- [ ] Test on both iOS Safari and Android Chrome
+- [ ] Verify "Add to Home Screen" works
+- [ ] Check responsive layouts (375px, 768px, 1920px)
+- [ ] Ensure touch targets are large enough (min 44px)
+- [ ] Test QR scanner on actual camera
+- [ ] No console errors on mobile
 
 ## License
 

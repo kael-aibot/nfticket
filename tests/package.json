@@ -1,0 +1,16 @@
+{
+  "name": "nfticket-tests",
+  "version": "1.0.0",
+  "description": "Comprehensive test suite for NFTicket",
+  "type": "module",
+  "scripts": {
+    "test": "vitest --config ./vitest.config.ts",
+    "test:ui": "vitest --config ./vitest.config.ts --ui",
+    "test:coverage": "vitest --config ./vitest.config.ts --coverage"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^1.0.0",
+    "@vitest/ui": "^1.0.0",
+    "vitest": "^1.0.0"
+  }
+}

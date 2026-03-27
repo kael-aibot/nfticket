@@ -1,20 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { createAuthOrchestrator } from '../../../lib/auth';
 import { ensureSeedData } from '../lib/mockData';
-import {
-  getAuthSessions,
-  getMagicLinks,
-  getSessionUserId,
-  getUsers,
-  getWalletChallenges,
-  saveAuthSessions,
-  saveMagicLinks,
-  saveSessionUserId,
-  saveUsers,
-  saveWalletChallenges,
-  uid,
-} from '../lib/storage';
 import type {
   AdminRole,
   AuthMode,
@@ -23,8 +9,8 @@ import type {
   AuthUser,
   MagicLinkRecord,
   UserRole,
-  WalletChallengeRecord,
 } from '../lib/types';
+import { hasPlatformAccess, normalizeUserRole } from '../lib/types';
 
 interface HybridAuthContextValue {
   user: AuthUser | null;
@@ -32,6 +18,7 @@ interface HybridAuthContextValue {
   authMode: AuthMode | null;
   walletAddress: string | null;
   walletConnected: boolean;
+  authReady: boolean;
   signInWithCredentials: (email: string, password: string) => Promise<void>;
   signUpWithCredentials: (name: string, email: string, password: string, role: UserRole) => Promise<void>;
   signInWithSocial: (provider: Exclude<AuthProvider, 'credentials'>, role: UserRole) => Promise<void>;
@@ -44,54 +31,84 @@ interface HybridAuthContextValue {
   signOut: () => void;
 }
 
+type SessionValidationResponse = {
+  valid: boolean;
+  user: {
+    id: string;
+    email: string | null;
+    role: string;
+  };
+};
+
+type CurrentUserResponse = {
+  id: string;
+  email: string | null;
+  displayName?: string | null;
+  role: string;
+  wallets?: string[];
+  authMode?: AuthMode;
+  kycStatus?: AuthUser['kycStatus'];
+  createdAt?: number;
+};
+
+type WalletChallengeResponse = {
+  id: string;
+  message: string;
+  walletAddress: string;
+  expiresAt: number;
+};
+
 const HybridAuthContext = createContext<HybridAuthContextValue | undefined>(undefined);
 
 export function HybridAuthProvider({ children }: { children: React.ReactNode }) {
   const wallet = useWallet();
   const [user, setUser] = useState<AuthUser | null>(null);
   const [session, setSession] = useState<AuthSessionRecord | null>(null);
-
-  const auth = useMemo(() => createAuthOrchestrator<AuthUser>({
-    listIdentities: getUsers,
-    saveIdentities: saveUsers,
-    listSessions: getAuthSessions,
-    saveSessions: saveAuthSessions,
-    listMagicLinks: getMagicLinks,
-    saveMagicLinks,
-    listWalletChallenges: getWalletChallenges,
-    saveWalletChallenges,
-    uid,
-    verifySignature: async ({ signature, signedMessage, challenge }) =>
-      signature.trim().length > 0 && signedMessage === challenge.message,
-  }), []);
-
-  function persistUser(nextUser: AuthUser) {
-    const users = getUsers();
-    saveUsers(users.map((item) => (item.id === nextUser.id ? nextUser : item)));
-    setUser(nextUser);
-  }
-
-  function openSession(nextUser: AuthUser, authMode: AuthMode, walletAddress?: string | null) {
-    const nextSession = auth.createSession({
-      userId: nextUser.id,
-      authMode,
-      walletAddress: walletAddress ?? null,
-    });
-    saveSessionUserId(nextUser.id);
-    setUser(nextUser);
-    setSession(nextSession);
-    return nextSession;
-  }
+  const [authReady, setAuthReady] = useState(false);
 
   useEffect(() => {
     ensureSeedData();
-    const users = getUsers();
-    const sessionUserId = getSessionUserId();
-    const nextUser = users.find((item) => item.id === sessionUserId) ?? null;
-    setUser(nextUser);
-    const nextSession = getAuthSessions().find((item) => item.userId === sessionUserId) ?? null;
-    setSession(nextSession ? auth.restoreSession(nextSession.id) : null);
-  }, [auth]);
+
+    let cancelled = false;
+
+    async function bootstrapSecureSession() {
+      try {
+        const validation = await postAuth<SessionValidationResponse>('session:validate');
+        if (!validation.ok || !validation.data.valid) {
+          if (!cancelled) {
+            setUser(null);
+            setSession(null);
+          }
+          return;
+        }
+
+        const profile = await postAuth<CurrentUserResponse>('user:get');
+        if (!profile.ok || !profile.data) {
+          if (!cancelled) {
+            setUser(null);
+            setSession(null);
+          }
+          return;
+        }
+
+        if (!cancelled) {
+          const nextUser = toAuthUser(profile.data, validation.data.user);
+          setUser(nextUser);
+          setSession(toSessionRecord(nextUser));
+        }
+      } finally {
+        if (!cancelled) {
+          setAuthReady(true);
+        }
+      }
+    }
+
+    void bootstrapSecureSession();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const value = useMemo<HybridAuthContextValue>(() => ({
     user,
@@ -99,236 +116,133 @@ export function HybridAuthProvider({ children }: { children: React.ReactNode }) 
     authMode: session?.authMode ?? user?.authMode ?? null,
     walletAddress: wallet.publicKey?.toBase58() ?? null,
     walletConnected: Boolean(wallet.publicKey),
+    authReady,
     async signInWithCredentials(email, password) {
-      const existing = getUsers().find((item) => item.email.toLowerCase() === email.toLowerCase());
-      if (!existing || existing.password !== password) {
-        throw new Error('Invalid email or password');
+      const response = await postAuth('login', { email, password });
+      if (!response.ok) {
+        throw new Error(response.error ?? 'Invalid email or password');
       }
-      const nextUser: AuthUser = {
-        ...existing,
-        emailVerified: true,
-        authMode: existing.linkedWallets.length > 0 ? 'hybrid' : 'email',
-        lastLoginAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-      persistUser(nextUser);
-      openSession(nextUser, nextUser.authMode);
+
+      const validation = await postAuth<SessionValidationResponse>('session:validate');
+      const profile = await postAuth<CurrentUserResponse>('user:get');
+      if (!validation.ok || !validation.data.valid || !profile.ok || !profile.data) {
+        throw new Error('Session established but user profile could not be loaded');
+      }
+
+      const nextUser = toAuthUser(profile.data, validation.data.user);
+      setUser(nextUser);
+      setSession(toSessionRecord(nextUser));
+      setAuthReady(true);
     },
     async signUpWithCredentials(name, email, password, role) {
-      const users = getUsers();
-      const duplicate = users.find((item) => item.email.toLowerCase() === email.toLowerCase());
-      if (duplicate) {
-        throw new Error('Email is already registered');
-      }
-      const createdUser: AuthUser = {
-        id: uid('user'),
-        name,
-        email,
-        password,
-        provider: 'credentials',
-        role,
-        emailVerified: false,
-        wallets: [],
-        linkedWallets: [],
-        authMode: 'email',
-        kycStatus: 'not_required',
-        adminRoles: role === 'admin' ? ['support', 'finance', 'auth', 'operations'] : [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        lastLoginAt: Date.now(),
-      };
-      saveUsers([createdUser, ...users]);
-      openSession(createdUser, 'email');
-    },
-    async signInWithSocial(provider, role) {
-      const email = `${provider}.${role}@nfticket.app`;
-      const users = getUsers();
-      let socialUser = users.find((item) => item.email === email);
-      if (!socialUser) {
-        socialUser = {
-          id: uid('user'),
-          name: `${provider[0].toUpperCase()}${provider.slice(1)} ${role === 'provider' ? 'Organizer' : 'Buyer'}`,
-          email,
-          provider,
-          role,
-          emailVerified: true,
-          wallets: [],
-          linkedWallets: [],
-          authMode: 'email',
-          kycStatus: 'not_required',
-          adminRoles: [],
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          lastLoginAt: Date.now(),
-        };
-        saveUsers([socialUser, ...users]);
-      }
-      const nextUser: AuthUser = {
-        ...socialUser,
-        emailVerified: true,
-        authMode: socialUser.linkedWallets.length > 0 ? 'hybrid' : 'email',
-        updatedAt: Date.now(),
-        lastLoginAt: Date.now(),
-      };
-      persistUser(nextUser);
-      openSession(nextUser, nextUser.authMode);
-    },
-    async requestMagicLink(email, purpose = 'sign_in') {
-      const existing = getUsers().find((item) => item.email.toLowerCase() === email.toLowerCase());
-      return auth.issueMagicLink({
-        email,
-        purpose,
-        userId: existing?.id ?? null,
-      });
-    },
-    async consumeMagicLink(token) {
-      const link = auth.consumeMagicLink(token);
-      let nextUser = getUsers().find((item) => item.id === link.userId)
-        ?? getUsers().find((item) => item.email.toLowerCase() === link.email.toLowerCase())
-        ?? null;
-
-      if (!nextUser) {
-        nextUser = {
-          id: uid('user'),
-          name: link.email.split('@')[0] || 'NFTicket User',
-          email: link.email,
-          provider: 'credentials',
-          role: 'buyer',
-          emailVerified: true,
-          wallets: [],
-          linkedWallets: [],
-          authMode: 'email',
-          kycStatus: 'not_required',
-          adminRoles: [],
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          lastLoginAt: Date.now(),
-        };
-        saveUsers([nextUser, ...getUsers()]);
-      } else {
-        nextUser = {
-          ...nextUser,
-          emailVerified: true,
-          authMode: nextUser.linkedWallets.length > 0 ? 'hybrid' : 'email',
-          updatedAt: Date.now(),
-          lastLoginAt: Date.now(),
-        };
-        persistUser(nextUser);
+      void role;
+      const response = await postAuth('register', { email, password, displayName: name });
+      if (!response.ok) {
+        throw new Error(response.error ?? 'Registration failed');
       }
 
-      openSession(nextUser, nextUser.linkedWallets.length > 0 ? 'hybrid' : 'email');
-    },
-    async requestAccountRecovery(email) {
-      const existing = getUsers().find((item) => item.email.toLowerCase() === email.toLowerCase());
-      if (!existing) {
-        throw new Error('No account exists for that email');
+      const validation = await postAuth<SessionValidationResponse>('session:validate');
+      const profile = await postAuth<CurrentUserResponse>('user:get');
+      if (!validation.ok || !validation.data.valid || !profile.ok || !profile.data) {
+        throw new Error('Account created but user profile could not be loaded');
       }
-      return auth.issueMagicLink({
-        email,
-        purpose: 'account_recovery',
-        userId: existing.id,
-      });
+
+      const nextUser = toAuthUser(profile.data, validation.data.user);
+      setUser(nextUser);
+      setSession(toSessionRecord(nextUser));
+      setAuthReady(true);
+    },
+    async signInWithSocial() {
+      throw new Error('Social sign-in is not available in the secure session flow.');
+    },
+    async requestMagicLink() {
+      throw new Error('Magic-link authentication is not available in the secure session flow.');
+    },
+    async consumeMagicLink() {
+      throw new Error('Magic-link authentication is not available in the secure session flow.');
+    },
+    async requestAccountRecovery() {
+      throw new Error('Account recovery is not available in the secure session flow.');
     },
     async signInWithWallet() {
-      if (!wallet.publicKey) {
-        throw new Error('Connect a wallet to sign in');
-      }
-      if (!wallet.signMessage) {
-        throw new Error('Connected wallet does not support message signing');
-      }
-
-      const walletAddress = wallet.publicKey.toBase58();
-      const challenge = auth.issueWalletChallenge({
+      const walletAddress = await ensureWalletSignatureReady(wallet);
+      const challenge = await postAuth<WalletChallengeResponse>('wallet:challenge', {
         walletAddress,
-        userId: user?.id ?? null,
+        purpose: 'sign_in',
       });
-      const signedBytes = await wallet.signMessage(new TextEncoder().encode(challenge.message));
-      const signature = bytesToBase64(signedBytes);
-      await auth.verifyWalletChallenge({
-        challenge,
-        signature,
-        signedMessage: challenge.message,
-      });
-
-      let nextUser = getUsers().find((item) => item.linkedWallets.includes(walletAddress)) ?? user ?? null;
-      if (!nextUser) {
-        nextUser = {
-          id: uid('user'),
-          name: `${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)}`,
-          email: `${walletAddress.toLowerCase()}@wallet.nfticket.local`,
-          provider: 'credentials',
-          role: 'buyer',
-          emailVerified: false,
-          wallets: [walletAddress],
-          linkedWallets: [walletAddress],
-          authMode: 'wallet',
-          kycStatus: 'not_required',
-          adminRoles: [],
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          lastLoginAt: Date.now(),
-        };
-        saveUsers([nextUser, ...getUsers()]);
-      } else if (!nextUser.linkedWallets.includes(walletAddress)) {
-        nextUser = {
-          ...auth.linkWallet(nextUser.id, walletAddress),
-          linkedWallets: Array.from(new Set([walletAddress, ...nextUser.linkedWallets])),
-          updatedAt: Date.now(),
-          lastLoginAt: Date.now(),
-        };
-        persistUser(nextUser);
+      if (!challenge.ok || !challenge.data?.message || !challenge.data?.id) {
+        throw new Error(challenge.error ?? 'Unable to issue wallet sign-in challenge');
       }
 
-      openSession(nextUser, nextUser.emailVerified ? 'hybrid' : 'wallet', walletAddress);
+      const signature = await signWalletMessage(wallet, challenge.data.message);
+      const response = await postAuth('wallet:sign-in', {
+        walletAddress,
+        challengeId: challenge.data.id,
+        signature,
+      });
+      if (!response.ok) {
+        throw new Error(response.error ?? 'Wallet sign-in failed');
+      }
+
+      const validation = await postAuth<SessionValidationResponse>('session:validate');
+      const profile = await postAuth<CurrentUserResponse>('user:get');
+      if (!validation.ok || !validation.data.valid || !profile.ok || !profile.data) {
+        throw new Error('Wallet session established but user profile could not be loaded');
+      }
+
+      const nextUser = toAuthUser(profile.data, validation.data.user);
+      setUser(nextUser);
+      setSession(toSessionRecord(nextUser));
+      setAuthReady(true);
     },
     async linkWallet() {
       if (!user) {
-        throw new Error('Sign in before linking a wallet');
-      }
-      if (!wallet.publicKey) {
-        throw new Error('Connect a wallet to link it');
-      }
-      if (!wallet.signMessage) {
-        throw new Error('Connected wallet does not support message signing');
+        throw new Error('Authentication required');
       }
 
-      const walletAddress = wallet.publicKey.toBase58();
-      const challenge = auth.issueWalletChallenge({
+      const walletAddress = await ensureWalletSignatureReady(wallet);
+      const challenge = await postAuth<WalletChallengeResponse>('wallet:challenge', {
         walletAddress,
-        userId: user.id,
+        purpose: 'link_wallet',
       });
-      const signedBytes = await wallet.signMessage(new TextEncoder().encode(challenge.message));
-      await auth.verifyWalletChallenge({
-        challenge,
-        signature: bytesToBase64(signedBytes),
-        signedMessage: challenge.message,
-      });
-
-      const linked = auth.linkWallet(user.id, walletAddress);
-      const nextUser: AuthUser = {
-        ...linked,
-        linkedWallets: linked.wallets,
-        authMode: linked.emailVerified ? 'hybrid' : 'wallet',
-        updatedAt: Date.now(),
-      };
-      persistUser(nextUser);
-      if (session) {
-        openSession(nextUser, nextUser.authMode, walletAddress);
+      if (!challenge.ok || !challenge.data?.message || !challenge.data?.id) {
+        throw new Error(challenge.error ?? 'Unable to issue wallet-link challenge');
       }
+
+      const signature = await signWalletMessage(wallet, challenge.data.message);
+      const response = await postAuth('wallet:link', {
+        walletAddress,
+        challengeId: challenge.data.id,
+        signature,
+      });
+      if (!response.ok) {
+        throw new Error(response.error ?? 'Wallet linking failed');
+      }
+
+      const profile = await postAuth<CurrentUserResponse>('user:get');
+      if (!profile.ok || !profile.data) {
+        throw new Error('Wallet linked but user profile could not be refreshed');
+      }
+
+      const nextUser = toAuthUser(profile.data, {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+      });
+      setUser(nextUser);
+      setSession(toSessionRecord(nextUser));
       return walletAddress;
     },
     hasAdminAccess(role) {
-      return user?.role === 'admin' && (user.adminRoles.includes(role) || user.adminRoles.length === 0);
+      return Boolean(user && hasPlatformAccess(user.role) && (user.adminRoles.includes(role) || user.adminRoles.length === 0));
     },
     signOut() {
-      if (session) {
-        auth.revokeSession(session.id);
-      }
-      saveSessionUserId(null);
       setUser(null);
       setSession(null);
+      setAuthReady(true);
+      void postAuth('logout');
     },
-  }), [auth, session, user, wallet]);
+  }), [authReady, session, user, wallet]);
 
   return <HybridAuthContext.Provider value={value}>{children}</HybridAuthContext.Provider>;
 }
@@ -341,15 +255,131 @@ export function useHybridAuth() {
   return context;
 }
 
-function bytesToBase64(value: Uint8Array): string {
-  if (typeof Buffer !== 'undefined') {
-    return Buffer.from(value).toString('base64');
+async function postAuth<T = Record<string, never>>(action: string, body?: Record<string, unknown>): Promise<{
+  ok: boolean;
+  data: T;
+  error?: string;
+}> {
+  try {
+    const response = await fetch('/api/auth', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        action,
+        ...(body ?? {}),
+      }),
+    });
+
+    const payload = response.headers.get('content-type')?.includes('application/json')
+      ? await response.json()
+      : null;
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        data: {} as T,
+        error: typeof payload?.error === 'string' ? payload.error : `Authentication request failed (${response.status})`,
+      };
+    }
+
+    return {
+      ok: true,
+      data: (payload ?? {}) as T,
+    };
+  } catch {
+    return {
+      ok: false,
+      data: {} as T,
+      error: 'Authentication request failed',
+    };
+  }
+}
+
+function toAuthUser(profile: CurrentUserResponse, sessionUser: SessionValidationResponse['user']): AuthUser {
+  const email = profile.email ?? sessionUser.email ?? `${profile.id}@nfticket.local`;
+  const wallets = profile.wallets ?? [];
+  const role = normalizeUserRole(profile.role || sessionUser.role);
+  const authMode = normalizeAuthMode(profile.authMode);
+  const createdAt = profile.createdAt ?? Date.now();
+
+  return {
+    id: profile.id,
+    name: profile.displayName?.trim() || email.split('@')[0] || 'NFTicket User',
+    email,
+    provider: 'credentials',
+    role,
+    emailVerified: true,
+    wallets,
+    linkedWallets: wallets,
+    authMode,
+    kycStatus: profile.kycStatus ?? 'not_required',
+    adminRoles: role === 'admin' ? ['support', 'finance', 'auth', 'operations'] : [],
+    createdAt,
+    updatedAt: Date.now(),
+    lastLoginAt: Date.now(),
+  };
+}
+
+function toSessionRecord(user: AuthUser): AuthSessionRecord {
+  const now = Date.now();
+  return {
+    id: `secure:${user.id}`,
+    userId: user.id,
+    authMode: user.authMode,
+    walletAddress: user.linkedWallets[0] ?? null,
+    createdAt: now,
+    expiresAt: now + 7 * 24 * 60 * 60 * 1000,
+    lastValidatedAt: now,
+  };
+}
+
+function normalizeAuthMode(authMode: string | null | undefined): AuthMode {
+  if (authMode === 'wallet' || authMode === 'hybrid' || authMode === 'email') {
+    return authMode;
   }
 
-  let binary = '';
-  for (let i = 0; i < value.length; i += 1) {
-    binary += String.fromCharCode(value[i]);
+  return 'email';
+}
+
+async function ensureWalletSignatureReady(wallet: ReturnType<typeof useWallet>): Promise<string> {
+  if (!wallet.connected) {
+    await wallet.connect();
   }
 
-  return btoa(binary);
+  const walletAddress = wallet.publicKey?.toBase58();
+  if (!walletAddress) {
+    throw new Error('Wallet not connected');
+  }
+  if (!wallet.signMessage) {
+    throw new Error('Connected wallet does not support message signing');
+  }
+
+  return walletAddress;
+}
+
+async function signWalletMessage(
+  wallet: ReturnType<typeof useWallet>,
+  message: string,
+): Promise<string> {
+  if (!wallet.signMessage) {
+    throw new Error('Connected wallet does not support message signing');
+  }
+
+  const signature = await wallet.signMessage(new TextEncoder().encode(message));
+  return bytesToBase64(signature);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof window !== 'undefined' && typeof window.btoa === 'function') {
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 1) {
+      binary += String.fromCharCode(bytes[index]);
+    }
+    return window.btoa(binary);
+  }
+
+  return Buffer.from(bytes).toString('base64');
 }

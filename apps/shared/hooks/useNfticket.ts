@@ -1,163 +1,689 @@
+import { useCallback } from 'react';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
-import { Program, AnchorProvider, web3, BN } from '@coral-xyz/anchor';
-import { PublicKey, SystemProgram, LAMPORTS_PER_SOL } from '@solana/web3.js';
-import { useCallback, useMemo } from 'react';
-import idl from '../idl/nfticket.json';
+import {
+  PublicKey,
+  Transaction,
+} from '@solana/web3.js';
+import {
+  createAssociatedTokenAccountInstruction,
+  createTransferInstruction,
+  getAssociatedTokenAddressSync,
+} from '@solana/spl-token';
+import { defaultEventConfiguration, type AuthMode, type EventAuthRequirements } from '../../../lib/domain';
+import { createFulfillmentService } from '../../../lib/fulfillment';
+import type { BuyerNotification, FulfillmentOrderRecord, FulfillmentTicketRecord } from '../../../lib/fulfillment';
+import type { FulfillmentStatus, NotificationStatus, OrderStatus, TicketStatus } from '../lib/types';
+import { evaluateKycGate } from '../../../lib/kyc';
+import { buyResaleTicket as settleResalePurchase, createResaleListing } from '../../../lib/marketplace';
+import { createMintingService } from '../../../lib/minting';
+import { createOperationsService } from '../../../lib/operations';
+import { evaluateScanFraud } from '../../../lib/transfers';
+import { useHybridAuth } from '../auth/HybridAuthContext';
+import { createPaymentService } from '../lib/payments';
+import { ensureSeedData } from '../lib/mockData';
+import { calculatePrimaryPrice } from '../lib/pricing';
+import { toScannerCredential } from '../lib/scannerCredentials';
+import { defaultSettings, loadSettings } from '../lib/settings';
+import {
+  getEvents,
+  getFailedFlows,
+  getFraudFlags,
+  getIncidentAlerts,
+  getKycRecords,
+  getOrders,
+  getPayoutSplits,
+  getResaleListings,
+  getTickets,
+  getTransferAuditLog,
+  saveEvents,
+  saveFailedFlows,
+  saveFraudFlags,
+  saveIncidentAlerts,
+  saveOrders,
+  savePayoutSplits,
+  saveResaleListings,
+  saveTickets,
+  saveTransferAuditLog,
+  uid,
+} from '../lib/storage';
+import type {
+  EventRecord,
+  FailedFlowRecord,
+  IncidentAlertRecord,
+  NftMode,
+  PaymentMethod,
+  PaymentOrder,
+  ReceiptRecord,
+  TicketRecord,
+  AuthUser,
+} from '../lib/types';
+import type { FulfillmentResult as ApiFulfillmentResult } from '../lib/payments';
 
-const PROGRAM_ID = new PublicKey('NFTicket111111111111111111111111111111111111');
+export type Event = EventRecord;
+export type Ticket = TicketRecord & { event?: EventRecord | null };
 
-export interface Event {
-  id: string;
-  publicKey: PublicKey;
-  organizer: string;
-  name: string;
-  description: string;
-  eventDate: number;
-  venue: string;
-  tiers: TicketTier[];
-  resaleConfig: ResaleConfig;
-  isActive: boolean;
-  totalTicketsSold: number;
-  totalRevenue: number;
-  authorizedScanners: string[];
-  createdAt: number;
-}
+const placeholderPublicKey = '11111111111111111111111111111111';
+const pendingCheckoutStorageKey = 'nfticket:pendingCheckout';
 
-export interface TicketTier {
-  name: string;
-  price: number;
-  supply: number;
-  sold: number;
-  benefits: string;
-}
-
-export interface ResaleConfig {
-  timeDecayEnabled: boolean;
-  maxPremiumBps: number;
-  organizerRoyalty: number;
-  originalBuyerRoyalty: number;
-  charityRoyalty: number;
-  charityAddress: PublicKey | null;
-}
-
-export interface Ticket {
-  id: string;
-  publicKey: PublicKey;
+type PendingCheckoutRecord = {
+  orderId: string;
   eventId: string;
-  event?: {
-    name: string;
-    description: string;
-    eventDate: number;
-    venue: string;
-    organizer?: string;
-  };
-  owner: string;
   tierIndex: number;
-  tierName: string;
-  seatInfo: string | null;
-  purchasePrice: number;
-  purchaseTime: number;
-  scanStatus: any;
-  resaleCount: number;
-  isForSale: boolean;
-  salePrice: number | null;
+  paymentMethod: PaymentMethod;
+  amount: number;
+  createdAt: number;
+};
+
+function resolveDefaultNftMode(event?: EventRecord): NftMode {
+  if (event?.nftMode === 'metadata') {
+    return 'metadata';
+  }
+
+  return process.env.NEXT_PUBLIC_NFTICKET_NFT_MODE === 'metadata' ? 'metadata' : 'compressed';
+}
+
+function canUseWindow() {
+  return typeof window !== 'undefined';
+}
+
+function readPendingCheckouts(): PendingCheckoutRecord[] {
+  if (!canUseWindow()) {
+    return [];
+  }
+
+  try {
+    const value = window.localStorage.getItem(pendingCheckoutStorageKey);
+    return value ? (JSON.parse(value) as PendingCheckoutRecord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingCheckouts(records: PendingCheckoutRecord[]) {
+  if (!canUseWindow()) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(pendingCheckoutStorageKey, JSON.stringify(records));
+  } catch {
+    // Ignore localStorage write failures in browser-only reconciliation state.
+  }
+}
+
+function upsertPendingCheckout(record: PendingCheckoutRecord) {
+  const records = readPendingCheckouts();
+  const next = records.filter((entry) => entry.orderId !== record.orderId);
+  writePendingCheckouts([record, ...next]);
+}
+
+function removePendingCheckout(orderId: string) {
+  writePendingCheckouts(readPendingCheckouts().filter((entry) => entry.orderId !== orderId));
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function syncEventSales(eventId: string, tierIndex: number, amount: number) {
+  const events = getEvents();
+  saveEvents(events.map((item) => {
+    if (item.id !== eventId) {
+      return item;
+    }
+
+    return {
+      ...item,
+      tiers: item.tiers.map((tier, index) =>
+        index === tierIndex ? { ...tier, sold: tier.sold + 1 } : tier,
+      ),
+      totalTicketsSold: item.totalTicketsSold + 1,
+      totalRevenue: item.totalRevenue + amount,
+    };
+  }));
+}
+
+function syncFulfillmentState(result: ApiFulfillmentResult) {
+  const fulfilledTicket = result.ticket as Partial<TicketRecord> | undefined;
+  const fulfilledOrder = result.order as Partial<PaymentOrder> | undefined;
+
+  if (fulfilledTicket?.id) {
+    const existingTickets = getTickets();
+    const current = existingTickets.find((entry) => entry.id === fulfilledTicket.id);
+    if (current) {
+      saveTickets(existingTickets.map((entry) => (
+        entry.id === fulfilledTicket.id
+          ? {
+              ...entry,
+              ...fulfilledTicket,
+              assetId: fulfilledTicket.assetId ?? result.mintResult?.assetId ?? entry.assetId ?? null,
+              mintAddress: fulfilledTicket.mintAddress ?? result.mintResult?.mintAddress ?? entry.mintAddress ?? null,
+              mintSignature: fulfilledTicket.mintSignature ?? result.mintResult?.signature ?? entry.mintSignature ?? null,
+              fulfillmentStatus: fulfilledTicket.fulfillmentStatus ?? entry.fulfillmentStatus ?? 'pending',
+            }
+          : entry
+      )));
+    }
+  }
+
+  if (fulfilledOrder?.id) {
+    const existingOrders = getOrders();
+    const current = existingOrders.find((entry) => entry.id === fulfilledOrder.id);
+    if (current) {
+      saveOrders(existingOrders.map((entry) => (
+        entry.id === fulfilledOrder.id
+          ? {
+              ...entry,
+              ...fulfilledOrder,
+              assetId: fulfilledOrder.assetId ?? result.mintResult?.assetId ?? entry.assetId ?? null,
+              mintAddress: fulfilledOrder.mintAddress ?? result.mintResult?.mintAddress ?? entry.mintAddress ?? null,
+              mintSignature: fulfilledOrder.mintSignature ?? result.mintResult?.signature ?? entry.mintSignature ?? null,
+            }
+          : entry
+      )));
+    }
+  }
+}
+
+function createBrowserFulfillmentServices() {
+  const minting = createMintingService({
+    environment: {
+      cluster: 'devnet',
+      rpcUrl: process.env.NEXT_PUBLIC_SOLANA_RPC_URL,
+      commitment: 'confirmed',
+      treasuryWallet: placeholderPublicKey,
+      usdcMint: placeholderPublicKey,
+      merkleTreeAddress: placeholderPublicKey,
+      collectionMint: placeholderPublicKey,
+      collectionUpdateAuthority: placeholderPublicKey,
+      nftMode: resolveDefaultNftMode(),
+    },
+  });
+
+  const store = {
+    async getOrderByIdempotencyKey(idempotencyKey: string) {
+      const order = getOrders().find((entry) => entry.idempotencyKey === idempotencyKey);
+      return order ? toFulfillmentOrder(order) : null;
+    },
+    async getOrderByTicketId(ticketId: string) {
+      const order = getOrders().find((entry) => entry.ticketId === ticketId);
+      return order ? toFulfillmentOrder(order) : null;
+    },
+    async saveOrder(order: FulfillmentOrderRecord) {
+      const next = fromFulfillmentOrder(order);
+      saveOrders(upsertRecord(getOrders(), next));
+      return order;
+    },
+    async getTicket(ticketId: string) {
+      const ticket = getTickets().find((entry) => entry.id === ticketId);
+      return ticket ? toFulfillmentTicket(ticket) : null;
+    },
+    async saveTicket(ticket: FulfillmentTicketRecord) {
+      const next = fromFulfillmentTicket(ticket);
+      saveTickets(upsertRecord(getTickets(), next));
+      return ticket;
+    },
+    async saveReceipt(receipt: ReceiptRecord) {
+      return receipt;
+    },
+    async saveNotification(notification: BuyerNotification) {
+      const orders = getOrders();
+      const order = orders.find((entry) => entry.id === notification.orderId);
+      if (order) {
+        saveOrders(
+          orders.map((entry) =>
+            entry.id === order.id
+              ? {
+                  ...entry,
+                  notificationStatus: notification.status as NotificationStatus,
+                }
+              : entry,
+          ),
+        );
+      }
+
+      return notification;
+    },
+  };
+
+  return createFulfillmentService({ store, minting });
+}
+
+function upsertRecord<T extends { id: string }>(records: T[], record: T): T[] {
+  const index = records.findIndex((entry) => entry.id === record.id);
+  if (index === -1) {
+    return [record, ...records];
+  }
+
+  return records.map((entry, entryIndex) => (entryIndex === index ? record : entry));
+}
+
+function toFulfillmentOrder(order: PaymentOrder): FulfillmentOrderRecord {
+  return {
+    id: order.id,
+    eventId: order.eventId,
+    ticketId: order.ticketId,
+    purchaserId: order.purchaserId,
+    amount: order.amount,
+    currency: order.currency ?? 'usd',
+    paymentRail: order.method === 'card' ? 'stripe' : 'sol',
+    status: order.status as OrderStatus,
+    paymentReference: order.paymentReference ?? null,
+    idempotencyKey: order.idempotencyKey ?? `${order.processor}:${order.eventId}:${order.ticketId}:${order.purchaserId}`,
+    nftMode: (order.nftMode ?? 'compressed') as NftMode,
+    receiptId: order.receiptId ?? null,
+    receiptLabel: order.receiptLabel ?? (order.method === 'card' ? 'Paid with card via Stripe' : 'Paid with crypto'),
+    fulfillmentStatus: (order.fulfillmentStatus ?? 'pending') as FulfillmentStatus,
+    notificationStatus: (order.notificationStatus ?? 'pending') as NotificationStatus,
+    assetId: order.assetId ?? null,
+    mintAddress: order.mintAddress ?? null,
+    mintSignature: order.mintSignature ?? null,
+    confirmedAt: order.confirmedAt ?? null,
+    fulfilledAt: order.fulfilledAt ?? null,
+    retryCount: order.retryCount ?? 0,
+    lastError: order.lastError ?? null,
+    createdAt: order.createdAt,
+  };
+}
+
+function fromFulfillmentOrder(order: FulfillmentOrderRecord): PaymentOrder {
+  return {
+    id: order.id,
+    eventId: order.eventId,
+    ticketId: order.ticketId ?? '',
+    purchaserId: order.purchaserId,
+    amount: order.amount,
+    currency: order.currency,
+    method: order.paymentRail === 'stripe' ? 'card' : 'crypto',
+    status: order.status,
+    processor: order.paymentRail === 'stripe' ? 'stripe' : 'solana',
+    nftMode: order.nftMode,
+    paymentReference: order.paymentReference,
+    idempotencyKey: order.idempotencyKey,
+    receiptLabel: order.receiptLabel,
+    receiptId: order.receiptId,
+    fulfillmentStatus: order.fulfillmentStatus as FulfillmentStatus,
+    notificationStatus: order.notificationStatus as NotificationStatus,
+    assetId: order.assetId,
+    mintAddress: order.mintAddress,
+    mintSignature: order.mintSignature,
+    confirmedAt: order.confirmedAt,
+    fulfilledAt: order.fulfilledAt,
+    retryCount: order.retryCount,
+    lastError: order.lastError,
+    createdAt: order.createdAt,
+  };
+}
+
+function toFulfillmentTicket(ticket: TicketRecord): FulfillmentTicketRecord {
+  return {
+    id: ticket.id,
+    eventId: ticket.eventId,
+    ownerId: ticket.ownerId,
+    ownerEmail: ticket.ownerEmail,
+    ownerName: ticket.ownerName,
+    ownerWallet: ticket.ownerWallet ?? null,
+    tierName: ticket.tierName,
+    purchasePrice: ticket.purchasePrice,
+    purchaseTime: ticket.purchaseTime,
+    status: ticket.status as TicketStatus,
+    nftMode: (ticket.nftMode ?? 'compressed') as NftMode,
+    assetId: ticket.assetId ?? null,
+    mintAddress: ticket.mintAddress ?? null,
+    mintSignature: ticket.mintSignature ?? null,
+    receiptId: ticket.receiptId ?? null,
+    fulfillmentStatus: (ticket.fulfillmentStatus ?? 'pending') as FulfillmentStatus,
+    lastFulfillmentError: ticket.lastFulfillmentError ?? null,
+    issuanceAttempts: ticket.issuanceAttempts ?? 0,
+  };
+}
+
+function fromFulfillmentTicket(ticket: FulfillmentTicketRecord): TicketRecord {
+  const existing = getTickets().find((entry) => entry.id === ticket.id);
+
+  return {
+    ...existing,
+    id: ticket.id,
+    eventId: ticket.eventId,
+    ownerId: ticket.ownerId,
+    ownerEmail: ticket.ownerEmail ?? '',
+    ownerName: ticket.ownerName ?? '',
+    ownerWallet: ticket.ownerWallet ?? null,
+    tierIndex: existing?.tierIndex ?? 0,
+    tierName: ticket.tierName ?? '',
+    seatInfo: existing?.seatInfo ?? null,
+    purchasePrice: ticket.purchasePrice ?? 0,
+    purchaseTime: ticket.purchaseTime ?? Date.now(),
+    paymentMethod: existing?.paymentMethod ?? 'card',
+    status: ticket.status as TicketStatus,
+    nftMode: ticket.nftMode,
+    assetId: ticket.assetId,
+    mintAddress: ticket.mintAddress,
+    mintSignature: ticket.mintSignature,
+    receiptId: ticket.receiptId,
+    fulfillmentStatus: ticket.fulfillmentStatus,
+    lastFulfillmentError: ticket.lastFulfillmentError,
+    issuanceAttempts: ticket.issuanceAttempts,
+    isForSale: existing?.isForSale ?? false,
+    salePrice: existing?.salePrice ?? null,
+    resaleCount: existing?.resaleCount ?? 0,
+    lastTransferredAt: existing?.lastTransferredAt ?? null,
+    lastScannedAt: existing?.lastScannedAt ?? null,
+    pendingTransferApproval: existing?.pendingTransferApproval ?? false,
+  };
+}
+
+function getMarketplaceState() {
+  return {
+    listings: getResaleListings(),
+    payoutSplits: getPayoutSplits(),
+    auditLog: getTransferAuditLog(),
+    fraudFlags: getFraudFlags(),
+  };
+}
+
+function prependRecords<T>(records: T[], nextRecords: T[]): T[] {
+  if (nextRecords.length === 0) {
+    return records;
+  }
+
+  return [...nextRecords, ...records];
+}
+
+function resolveEventAuthRequirements(event?: EventRecord): EventAuthRequirements {
+  const configuredMode = process.env.NEXT_PUBLIC_NFTICKET_AUTH_MODE as AuthMode | undefined;
+  return {
+    ...defaultEventConfiguration.auth,
+    mode: configuredMode ?? event?.authRequirements?.mode ?? defaultEventConfiguration.auth.mode,
+    requireVerifiedEmail: event?.authRequirements?.requireVerifiedEmail ?? defaultEventConfiguration.auth.requireVerifiedEmail,
+    requireWalletLink: event?.authRequirements?.requireWalletLink ?? defaultEventConfiguration.auth.requireWalletLink,
+    requireKyc: event?.authRequirements?.requireKyc ?? defaultEventConfiguration.auth.requireKyc,
+  };
+}
+
+function ensureWalletIdentity(walletAddress: string): AuthUser {
+  return {
+    id: uid('user'),
+    name: `${walletAddress.slice(0, 4)}...${walletAddress.slice(-4)}`,
+    email: `${walletAddress.toLowerCase()}@wallet.nfticket.local`,
+    provider: 'credentials',
+    role: 'buyer',
+    emailVerified: false,
+    wallets: [walletAddress],
+    linkedWallets: [walletAddress],
+    authMode: 'wallet',
+    kycStatus: 'not_required',
+    adminRoles: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    lastLoginAt: Date.now(),
+  };
+}
+
+function recordFailure(
+  type: FailedFlowRecord['type'],
+  input: {
+    error: Error;
+    eventId?: string | null;
+    orderId?: string | null;
+    ticketId?: string | null;
+    userId?: string | null;
+    idempotencyKey: string;
+    payload: Record<string, string>;
+  },
+) {
+  const operations = createOperationsService({
+    listFailedFlows: getFailedFlows,
+    saveFailedFlows,
+    listAlerts: getIncidentAlerts,
+    saveAlerts: saveIncidentAlerts,
+    uid,
+  });
+  operations.recordFailure({
+    type,
+    eventId: input.eventId ?? null,
+    orderId: input.orderId ?? null,
+    ticketId: input.ticketId ?? null,
+    userId: input.userId ?? null,
+    idempotencyKey: input.idempotencyKey,
+    errorMessage: input.error.message,
+    payload: input.payload,
+  });
 }
 
 export const useNfticket = () => {
   const { connection } = useConnection();
   const wallet = useWallet();
+  const auth = useHybridAuth();
 
-  const provider = useMemo(() => {
-    if (!wallet.publicKey) return null;
-    return new AnchorProvider(
-      connection,
-      wallet as any,
-      AnchorProvider.defaultOptions()
+  const ensureAuthenticatedCheckoutSession = useCallback(async () => {
+    if (!auth.user) {
+      throw new Error('Sign in with email to continue');
+    }
+
+    const response = await fetch('/api/auth', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      credentials: 'include',
+      body: JSON.stringify({
+        action: 'session:validate',
+      }),
+    });
+
+    const payload = response.headers.get('content-type')?.includes('application/json')
+      ? await response.json() as { valid?: boolean; user?: { id?: string | null } }
+      : null;
+
+    if (!response.ok || !payload?.valid || !payload.user?.id) {
+      throw new Error('Your session has expired. Sign in again to continue');
+    }
+
+    if (payload.user.id !== auth.user.id) {
+      throw new Error('The active session does not match the current user. Sign in again to continue');
+    }
+  }, [auth.user]);
+
+  const resolveActorForEvent = useCallback((event?: EventRecord) => {
+    ensureSeedData();
+    const authRequirements = resolveEventAuthRequirements(event);
+    const walletAddress = wallet.publicKey?.toBase58() ?? null;
+    const sessionUser = auth.user;
+
+    if (authRequirements.mode === 'wallet') {
+      if (!walletAddress) {
+        throw new Error('Connect a wallet to continue');
+      }
+      const walletUser = ensureWalletIdentity(walletAddress);
+      return {
+        userId: walletUser.id,
+        user: walletUser,
+        walletAddress,
+        authRequirements,
+      };
+    }
+
+    if (authRequirements.mode === 'email') {
+      if (!sessionUser) {
+        throw new Error('Sign in with email to continue');
+      }
+      if (authRequirements.requireVerifiedEmail && !sessionUser.emailVerified) {
+        throw new Error('Verify your email to continue');
+      }
+      return {
+        userId: sessionUser.id,
+        user: sessionUser,
+        walletAddress,
+        authRequirements,
+      };
+    }
+
+    if (sessionUser) {
+      return {
+        userId: sessionUser.id,
+        user: sessionUser,
+        walletAddress,
+        authRequirements,
+      };
+    }
+
+    if (walletAddress) {
+      const walletUser = ensureWalletIdentity(walletAddress);
+      return {
+        userId: walletUser.id,
+        user: walletUser,
+        walletAddress,
+        authRequirements,
+      };
+    }
+
+    throw new Error('Sign in or connect a wallet to continue');
+  }, [auth.user, wallet.publicKey]);
+
+  const enforceKycGate = useCallback((event: EventRecord, user: AuthUser, flow: 'purchase' | 'transfer') => {
+    const authRequirements = resolveEventAuthRequirements(event);
+    const eventKycRecord = getKycRecords().find((record) => record.userId === user.id && record.eventId === event.id);
+    const decision = evaluateKycGate({
+      required: authRequirements.requireKyc,
+      appliesTo: ['purchase', 'transfer'],
+      provider: eventKycRecord?.providerReference ?? null,
+    }, flow, {
+      userId: user.id,
+      status: user.kycStatus,
+      eventStatus: eventKycRecord?.status ?? null,
+    });
+    if (!decision.allowed) {
+      throw new Error(decision.message);
+    }
+  }, []);
+
+  const operations = useCallback(() => createOperationsService({
+    listFailedFlows: getFailedFlows,
+    saveFailedFlows,
+    listAlerts: getIncidentAlerts,
+    saveAlerts: saveIncidentAlerts,
+    uid,
+  }), []);
+
+  const submitUsdcPayment = useCallback(async (amount: number, recipientWallet: string, usdcMint: string) => {
+    if (!wallet.publicKey) {
+      throw new Error('Connect a wallet to pay with crypto');
+    }
+    if (!wallet.sendTransaction) {
+      throw new Error('Connected wallet does not support transactions');
+    }
+
+    const payer = wallet.publicKey;
+    const mint = new PublicKey(usdcMint);
+    const recipient = new PublicKey(recipientWallet);
+    const sourceAta = getAssociatedTokenAddressSync(mint, payer);
+    const destinationAta = getAssociatedTokenAddressSync(mint, recipient);
+    const amountRaw = BigInt(Math.round(amount * 1_000_000));
+
+    if (amountRaw <= BigInt(0)) {
+      throw new Error('Crypto payment amount must be greater than zero');
+    }
+
+    const transaction = new Transaction();
+    const destinationInfo = await connection.getAccountInfo(destinationAta);
+    if (!destinationInfo) {
+      transaction.add(
+        createAssociatedTokenAccountInstruction(
+          payer,
+          destinationAta,
+          recipient,
+          mint,
+        ),
+      );
+    }
+
+    transaction.add(
+      createTransferInstruction(
+        sourceAta,
+        destinationAta,
+        payer,
+        amountRaw,
+      ),
     );
+
+    const signature = await wallet.sendTransaction(transaction, connection);
+    await connection.confirmTransaction(signature, 'confirmed');
+    return signature;
   }, [connection, wallet]);
 
-  const program = useMemo(() => {
-    if (!provider) return null;
-    return new Program(idl as any, provider);
-  }, [provider]);
+  const reconcilePendingPurchases = useCallback(async () => {
+    if (!canUseWindow()) {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('canceled') === 'true') {
+      writePendingCheckouts(
+        readPendingCheckouts().filter((entry) => entry.paymentMethod !== 'card'),
+      );
+      return;
+    }
+
+    const paymentService = createPaymentService();
+    const pending = readPendingCheckouts();
+
+    for (const entry of pending) {
+      if (entry.paymentMethod !== 'card') {
+        continue;
+      }
+
+      const status = await paymentService.getPaymentStatus(entry.orderId);
+      if (status.status === 'confirmed') {
+        await paymentService.fulfillOrder(entry.orderId, wallet.publicKey?.toBase58() ?? null);
+        syncEventSales(entry.eventId, entry.tierIndex, entry.amount);
+        removePendingCheckout(entry.orderId);
+        continue;
+      }
+
+      if (status.status === 'failed' || status.status === 'cancelled') {
+        removePendingCheckout(entry.orderId);
+      }
+    }
+  }, [wallet.publicKey]);
+
+  const ensureFulfillmentFinalized = useCallback(async (
+    orderId: string,
+    ownerWallet: string | null,
+  ) => {
+    const paymentService = createPaymentService();
+    let result = await paymentService.fulfillOrder(orderId, ownerWallet);
+    syncFulfillmentState(result);
+
+    if (result.mintResult?.finality !== 'pending') {
+      return result;
+    }
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await delay(1_500 * (attempt + 1));
+      result = await paymentService.fulfillOrder(orderId, ownerWallet);
+      syncFulfillmentState(result);
+      if (result.mintResult?.finality !== 'pending') {
+        return result;
+      }
+    }
+
+    return result;
+  }, []);
 
   const fetchEvents = useCallback(async (): Promise<Event[]> => {
-    if (!program) return [];
-    try {
-      const events = await program.account.event.all();
-      return events.map((event: any) => ({
-        id: event.publicKey.toString(),
-        publicKey: event.publicKey,
-        organizer: event.account.organizer.toString(),
-        name: event.account.name,
-        description: event.account.description,
-        eventDate: event.account.eventDate.toNumber() * 1000,
-        venue: event.account.venue,
-        tiers: event.account.tiers.map((tier: any) => ({
-          name: tier.name,
-          price: tier.price.toNumber() / LAMPORTS_PER_SOL,
-          supply: tier.supply,
-          sold: tier.sold,
-          benefits: tier.benefits,
-        })),
-        resaleConfig: {
-          timeDecayEnabled: event.account.resaleConfig.timeDecayEnabled,
-          maxPremiumBps: event.account.resaleConfig.maxPremiumBps,
-          organizerRoyalty: event.account.resaleConfig.organizerRoyalty,
-          originalBuyerRoyalty: event.account.resaleConfig.originalBuyerRoyalty,
-          charityRoyalty: event.account.resaleConfig.charityRoyalty,
-          charityAddress: event.account.resaleConfig.charityAddress,
-        },
-        isActive: event.account.isActive,
-        totalTicketsSold: event.account.totalTicketsSold,
-        totalRevenue: event.account.totalRevenue.toNumber() / LAMPORTS_PER_SOL,
-        authorizedScanners: event.account.authorizedScanners.map((pk: any) => pk.toString()),
-        createdAt: event.account.createdAt.toNumber() * 1000,
-      }));
-    } catch (error) {
-      console.error('Error fetching events:', error);
-      return [];
-    }
-  }, [program]);
+    ensureSeedData();
+    return getEvents().sort((a, b) => a.eventDate - b.eventDate);
+  }, []);
 
   const fetchMyEvents = useCallback(async (): Promise<Event[]> => {
-    if (!program || !wallet.publicKey) return [];
-    try {
-      const events = await program.account.event.all([
-        {
-          memcmp: {
-            offset: 8,
-            bytes: wallet.publicKey.toBase58(),
-          },
-        },
-      ]);
-      return events.map((event: any) => ({
-        id: event.publicKey.toString(),
-        publicKey: event.publicKey,
-        organizer: event.account.organizer.toString(),
-        name: event.account.name,
-        description: event.account.description,
-        eventDate: event.account.eventDate.toNumber() * 1000,
-        venue: event.account.venue,
-        tiers: event.account.tiers.map((tier: any) => ({
-          name: tier.name,
-          price: tier.price.toNumber() / LAMPORTS_PER_SOL,
-          supply: tier.supply,
-          sold: tier.sold,
-          benefits: tier.benefits,
-        })),
-        resaleConfig: event.account.resaleConfig,
-        isActive: event.account.isActive,
-        totalTicketsSold: event.account.totalTicketsSold,
-        totalRevenue: event.account.totalRevenue.toNumber() / LAMPORTS_PER_SOL,
-        authorizedScanners: event.account.authorizedScanners.map((pk: any) => pk.toString()),
-        createdAt: event.account.createdAt.toNumber() * 1000,
-      }));
-    } catch (error) {
-      console.error('Error fetching my events:', error);
-      return [];
-    }
-  }, [program, wallet.publicKey]);
+    ensureSeedData();
+    const sessionUserId = auth.user?.id ?? null;
+    if (!sessionUserId) return [];
+    return getEvents().filter((event) => event.organizerId === sessionUserId);
+  }, [auth.user?.id]);
 
   const createEvent = useCallback(async (params: {
     name: string;
@@ -165,354 +691,531 @@ export const useNfticket = () => {
     eventDate: Date;
     venue: string;
     tiers: { name: string; price: number; supply: number; benefits: string }[];
-    resaleConfig?: {
-      timeDecayEnabled?: boolean;
-      maxPremiumBps?: number;
-      organizerRoyalty?: number;
-      originalBuyerRoyalty?: number;
-      charityRoyalty?: number;
-      charityAddress?: string;
-    };
+    acceptedPayments?: PaymentMethod[];
+    organizerName?: string;
+    authMode?: AuthMode;
+    requireKyc?: boolean;
+    walletOnly?: boolean;
   }) => {
-    if (!program || !wallet.publicKey) {
-      throw new Error('Wallet not connected');
+    ensureSeedData();
+    const sessionUserId = auth.user?.id ?? null;
+    if (!sessionUserId) {
+      throw new Error('Sign in to create an event');
     }
-    try {
-      const eventKeypair = web3.Keypair.generate();
-      const resaleConfig = {
-        timeDecayEnabled: params.resaleConfig?.timeDecayEnabled ?? true,
-        maxPremiumBps: params.resaleConfig?.maxPremiumBps ?? 5000,
-        organizerRoyalty: params.resaleConfig?.organizerRoyalty ?? 50,
-        originalBuyerRoyalty: params.resaleConfig?.originalBuyerRoyalty ?? 25,
-        charityRoyalty: params.resaleConfig?.charityRoyalty ?? 0,
-        charityAddress: params.resaleConfig?.charityAddress 
-          ? new PublicKey(params.resaleConfig.charityAddress)
-          : null,
-      };
 
-      const tx = await program.methods
-        .createEvent(
-          params.name,
-          params.description,
-          new BN(Math.floor(params.eventDate.getTime() / 1000)),
-          params.venue,
-          params.tiers.map(tier => ({
-            name: tier.name,
-            price: new BN(tier.price * LAMPORTS_PER_SOL),
-            supply: tier.supply,
-            sold: 0,
-            benefits: tier.benefits,
-          })),
-          resaleConfig
-        )
-        .accounts({
-          event: eventKeypair.publicKey,
-          organizer: wallet.publicKey,
-          systemProgram: SystemProgram.programId,
-        })
-        .signers([eventKeypair])
-        .rpc();
+    const events = getEvents();
+    const settings = loadSettings();
+    const authMode = params.walletOnly ? 'wallet' : (params.authMode ?? process.env.NEXT_PUBLIC_NFTICKET_AUTH_MODE as AuthMode | undefined ?? defaultEventConfiguration.auth.mode);
+    const nextEvent: EventRecord = {
+      id: uid('event'),
+      organizerId: sessionUserId,
+      organizerName: params.organizerName ?? 'Organizer',
+      organizerWallet: wallet.publicKey?.toBase58() ?? null,
+      name: params.name,
+      description: params.description,
+      eventDate: params.eventDate.getTime(),
+      venue: params.venue,
+      tiers: params.tiers.map((tier) => ({ ...tier, sold: 0 })),
+      acceptedPayments: params.acceptedPayments ?? ['card', 'crypto'],
+      nftMode: resolveDefaultNftMode(),
+      isActive: true,
+      totalTicketsSold: 0,
+      totalRevenue: 0,
+      authorizedScanners: [],
+      authRequirements: {
+        mode: authMode,
+        requireVerifiedEmail: authMode !== 'wallet',
+        requireWalletLink: authMode === 'wallet',
+        requireKyc: Boolean(params.requireKyc),
+      },
+      resaleConfig: settings,
+      createdAt: Date.now(),
+    };
 
-      return {
-        signature: tx,
-        eventPublicKey: eventKeypair.publicKey.toString(),
-      };
-    } catch (error) {
-      console.error('Error creating event:', error);
-      throw error;
-    }
-  }, [program, wallet.publicKey]);
+    saveEvents([nextEvent, ...events]);
 
-  const mintTicket = useCallback(async (
-    eventPublicKey: string | PublicKey,
+    return {
+      signature: `local_${nextEvent.id}`,
+      eventPublicKey: nextEvent.id,
+    };
+  }, [auth.user?.id, wallet.publicKey]);
+
+  const purchaseTicket = useCallback(async (
+    eventId: string,
     tierIndex: number,
-    seatInfo?: string
+    paymentMethod: PaymentMethod
   ) => {
-    if (!program || !wallet.publicKey) {
-      throw new Error('Wallet not connected');
+    ensureSeedData();
+    const events = getEvents();
+    const event = events.find((item) => item.id === eventId);
+    if (!event) {
+      throw new Error('Event not found');
     }
-    try {
-      const eventPk = typeof eventPublicKey === 'string' 
-        ? new PublicKey(eventPublicKey) 
-        : eventPublicKey;
-      const ticketKeypair = web3.Keypair.generate();
+    const actor = resolveActorForEvent(event);
+    enforceKycGate(event, actor.user, 'purchase');
 
-      const tx = await program.methods
-        .mintTicket(tierIndex, seatInfo || null)
-        .accounts({
-          event: eventPk,
-          ticket: ticketKeypair.publicKey,
-          buyer: wallet.publicKey,
-          systemProgram: SystemProgram.programId,
-        })
-        .signers([ticketKeypair])
-        .rpc();
-
-      return {
-        signature: tx,
-        ticketPublicKey: ticketKeypair.publicKey.toString(),
-      };
-    } catch (error) {
-      console.error('Error minting ticket:', error);
-      throw error;
+    const tier = event.tiers[tierIndex];
+    if (!tier) {
+      throw new Error('Ticket tier not found');
     }
-  }, [program, wallet.publicKey]);
+    if (tier.sold >= tier.supply) {
+      throw new Error('Ticket tier is sold out');
+    }
 
-  const fetchMyTickets = useCallback(async (): Promise<Ticket[]> => {
-    if (!program || !wallet.publicKey) return [];
+    const nftMode = resolveDefaultNftMode(event);
+    const ticketId = uid('ticket');
+    const paymentService = createPaymentService();
+    const idempotencyKey = `purchase:${paymentMethod}:${eventId}:${ticketId}:${actor.userId}`;
+    const settings = loadSettings();
+    const { total: totalPrice } = calculatePrimaryPrice(tier.price, settings);
+
     try {
-      const tickets = await program.account.ticket.all([
-        {
-          memcmp: {
-            offset: 8 + 32,
-            bytes: wallet.publicKey.toBase58(),
-          },
-        },
-      ]);
+      await ensureAuthenticatedCheckoutSession();
 
-      const ticketsWithEvents = await Promise.all(
-        tickets.map(async (ticket: any) => {
-          try {
-            const eventAccount = await program.account.event.fetch(ticket.account.eventId);
-            return {
-              id: ticket.publicKey.toString(),
-              publicKey: ticket.publicKey,
-              eventId: ticket.account.eventId.toString(),
-              event: {
-                name: eventAccount.name,
-                description: eventAccount.description,
-                eventDate: eventAccount.eventDate.toNumber() * 1000,
-                venue: eventAccount.venue,
-              },
-              owner: ticket.account.owner.toString(),
-              tierIndex: ticket.account.tierIndex,
-              tierName: ticket.account.tierName,
-              seatInfo: ticket.account.seatInfo,
-              purchasePrice: ticket.account.purchasePrice.toNumber() / LAMPORTS_PER_SOL,
-              purchaseTime: ticket.account.purchaseTime.toNumber() * 1000,
-              scanStatus: ticket.account.scanStatus,
-              resaleCount: ticket.account.resaleCount,
-              isForSale: ticket.account.isForSale,
-              salePrice: ticket.account.salePrice 
-                ? ticket.account.salePrice.toNumber() / LAMPORTS_PER_SOL 
-                : null,
-            };
-          } catch {
-            return {
-              id: ticket.publicKey.toString(),
-              publicKey: ticket.publicKey,
-              eventId: ticket.account.eventId.toString(),
-              owner: ticket.account.owner.toString(),
-              tierIndex: ticket.account.tierIndex,
-              tierName: ticket.account.tierName,
-              seatInfo: ticket.account.seatInfo,
-              purchasePrice: ticket.account.purchasePrice.toNumber() / LAMPORTS_PER_SOL,
-              purchaseTime: ticket.account.purchaseTime.toNumber() * 1000,
-              scanStatus: ticket.account.scanStatus,
-              resaleCount: ticket.account.resaleCount,
-              isForSale: ticket.account.isForSale,
-              salePrice: ticket.account.salePrice 
-                ? ticket.account.salePrice.toNumber() / LAMPORTS_PER_SOL 
-                : null,
-            };
-          }
-        })
+      if (paymentMethod === 'card') {
+        const paymentResult = await paymentService.submitPayment({
+          amount: totalPrice,
+          currency: 'usd',
+          eventId,
+          purchaserId: actor.userId,
+          ticketId,
+          method: paymentMethod,
+          nftMode,
+          idempotencyKey,
+          returnUrl: canUseWindow() ? `${window.location.origin}` : undefined,
+        });
+
+        if (!paymentResult.order?.id || !paymentResult.checkoutUrl) {
+          throw new Error('Stripe checkout could not be created');
+        }
+
+        upsertPendingCheckout({
+          orderId: paymentResult.order.id,
+          eventId,
+          tierIndex,
+          paymentMethod,
+          amount: totalPrice,
+          createdAt: Date.now(),
+        });
+
+        if (canUseWindow()) {
+          window.location.assign(paymentResult.checkoutUrl);
+          return new Promise<TicketRecord>(() => {});
+        }
+
+        throw new Error('Stripe checkout requires a browser environment');
+      }
+
+      const paymentIntent = await paymentService.submitPayment({
+        amount: totalPrice,
+        currency: 'USDC',
+        eventId,
+        purchaserId: actor.userId,
+        ticketId,
+        method: paymentMethod,
+        nftMode,
+        idempotencyKey,
+      });
+
+      if (!paymentIntent.requiresPayment || !paymentIntent.crypto) {
+        throw new Error('Crypto payment details are unavailable');
+      }
+
+      const transactionSignature = await submitUsdcPayment(
+        totalPrice,
+        paymentIntent.crypto.recipientWallet,
+        paymentIntent.crypto.usdcMint,
       );
 
-      return ticketsWithEvents;
-    } catch (error) {
-      console.error('Error fetching tickets:', error);
-      return [];
-    }
-  }, [program, wallet.publicKey]);
+      const paymentResult = await paymentService.submitPayment({
+        amount: totalPrice,
+        currency: paymentIntent.crypto.currency,
+        eventId,
+        purchaserId: actor.userId,
+        ticketId,
+        method: paymentMethod,
+        nftMode,
+        idempotencyKey,
+        payerWallet: wallet.publicKey?.toBase58(),
+        transactionSignature,
+      });
 
-  const fetchTicket = useCallback(async (ticketPublicKey: string | PublicKey): Promise<Ticket | null> => {
-    if (!program) return null;
-    try {
-      const ticketPk = typeof ticketPublicKey === 'string'
-        ? new PublicKey(ticketPublicKey)
-        : ticketPublicKey;
+      if (!paymentResult.order?.id) {
+        throw new Error('Crypto payment verification did not return an order');
+      }
 
-      const ticket = await program.account.ticket.fetch(ticketPk);
-      let eventAccount = null;
-      try {
-        eventAccount = await program.account.event.fetch(ticket.eventId);
-      } catch {}
+      const fulfillmentResult = await ensureFulfillmentFinalized(
+        paymentResult.order.id,
+        wallet.publicKey?.toBase58() ?? actor.walletAddress ?? null,
+      );
+
+      syncEventSales(eventId, tierIndex, totalPrice);
+
+      const fulfilledTicket = fulfillmentResult.ticket as {
+        id: string;
+        assetId?: string | null;
+        nftMode?: NftMode;
+        status?: TicketRecord['status'];
+        createdAt?: string | Date;
+      } | undefined;
+
+      if (!fulfilledTicket?.id) {
+        throw new Error('Ticket fulfillment did not persist');
+      }
 
       return {
-        id: ticketPk.toString(),
-        publicKey: ticketPk,
-        eventId: ticket.eventId.toString(),
-        event: eventAccount ? {
-          name: eventAccount.name,
-          description: eventAccount.description,
-          eventDate: eventAccount.eventDate.toNumber() * 1000,
-          venue: eventAccount.venue,
-          organizer: eventAccount.organizer.toString(),
-        } : null,
-        owner: ticket.owner.toString(),
-        tierIndex: ticket.tierIndex,
-        tierName: ticket.tierName,
-        seatInfo: ticket.seatInfo,
-        purchasePrice: ticket.purchasePrice.toNumber() / LAMPORTS_PER_SOL,
-        purchaseTime: ticket.purchaseTime.toNumber() * 1000,
-        scanStatus: ticket.scanStatus,
-        resaleCount: ticket.resaleCount,
-        isForSale: ticket.isForSale,
-        salePrice: ticket.salePrice ? ticket.salePrice.toNumber() / LAMPORTS_PER_SOL : null,
+        id: fulfilledTicket.id,
+        eventId,
+        ownerId: actor.userId,
+        ownerEmail: actor.user.email,
+        ownerName: actor.user.name,
+        ownerWallet: wallet.publicKey?.toBase58() ?? actor.walletAddress,
+        tierIndex,
+        tierName: tier.name,
+        seatInfo: null,
+        purchasePrice: tier.price,
+        purchaseTime: fulfilledTicket.createdAt ? new Date(fulfilledTicket.createdAt).getTime() : Date.now(),
+        paymentMethod,
+        status: fulfilledTicket.status ?? 'minted',
+        nftMode: fulfilledTicket.nftMode ?? nftMode,
+        assetId: fulfilledTicket.assetId ?? fulfillmentResult.mintResult?.assetId ?? null,
+        mintAddress: fulfillmentResult.mintResult?.mintAddress ?? null,
+        mintSignature: fulfillmentResult.mintResult?.signature ?? null,
+        receiptId: null,
+        fulfillmentStatus: 'completed',
+        lastFulfillmentError: null,
+        issuanceAttempts: 1,
+        isForSale: false,
+        salePrice: null,
+        resaleCount: 0,
+        lastTransferredAt: null,
+        lastScannedAt: null,
+        pendingTransferApproval: false,
       };
     } catch (error) {
-      console.error('Error fetching ticket:', error);
-      return null;
-    }
-  }, [program]);
-
-  const listTicketForResale = useCallback(async (
-    ticketPublicKey: string | PublicKey,
-    salePrice: number
-  ) => {
-    if (!program || !wallet.publicKey) {
-      throw new Error('Wallet not connected');
-    }
-    try {
-      const ticketPk = typeof ticketPublicKey === 'string'
-        ? new PublicKey(ticketPublicKey)
-        : ticketPublicKey;
-      const ticket = await program.account.ticket.fetch(ticketPk);
-
-      const tx = await program.methods
-        .listTicketForResale(new BN(salePrice * LAMPORTS_PER_SOL))
-        .accounts({
-          event: ticket.eventId,
-          ticket: ticketPk,
-          seller: wallet.publicKey,
-        })
-        .rpc();
-
-      return { signature: tx };
-    } catch (error) {
-      console.error('Error listing ticket for resale:', error);
+      recordFailure('payment', {
+        error: error instanceof Error ? error : new Error(String(error)),
+        eventId,
+        ticketId,
+        userId: actor.userId,
+        idempotencyKey,
+        payload: {
+          eventId,
+          tierIndex: String(tierIndex),
+          paymentMethod,
+          ticketId,
+        },
+      });
       throw error;
     }
-  }, [program, wallet.publicKey]);
+  }, [enforceKycGate, ensureFulfillmentFinalized, resolveActorForEvent, submitUsdcPayment, wallet.publicKey]);
 
-  const buyResaleTicket = useCallback(async (ticketPublicKey: string | PublicKey) => {
-    if (!program || !wallet.publicKey) {
-      throw new Error('Wallet not connected');
+  const mintTicket = useCallback(async (ticketId: string) => {
+    ensureSeedData();
+    if (!wallet.publicKey) {
+      throw new Error('Connect a wallet to mint tickets');
     }
+    const ticket = getTickets().find((entry) => entry.id === ticketId);
+    if (!ticket) {
+      throw new Error('Ticket not found');
+    }
+
+    if (ticket.status === 'minted') {
+      if (ticket.mintSignature && (ticket.mintAddress || ticket.assetId)) {
+        return {
+          signature: ticket.mintSignature,
+          ticketPublicKey: ticket.mintAddress ?? ticket.assetId ?? ticketId,
+        };
+      }
+    }
+
+    const order = getOrders().find((entry) => entry.ticketId === ticketId);
+    if (!order?.id) {
+      throw new Error('Ticket is not linked to a paid order that can be minted on-chain');
+    }
+
+    saveTickets(getTickets().map((entry) => entry.id === ticketId ? {
+      ...entry,
+      ownerWallet: wallet.publicKey?.toBase58() ?? null,
+    } : entry));
+
     try {
-      const ticketPk = typeof ticketPublicKey === 'string'
-        ? new PublicKey(ticketPublicKey)
-        : ticketPublicKey;
-      const ticket = await program.account.ticket.fetch(ticketPk);
+      const result = await ensureFulfillmentFinalized(order.id, wallet.publicKey.toBase58());
+      if (!result.mintResult?.signature || !(result.mintResult.mintAddress ?? result.mintResult.assetId)) {
+        throw new Error('Minting did not return on-chain asset details');
+      }
 
-      const tx = await program.methods
-        .buyResaleTicket()
-        .accounts({
-          event: ticket.eventId,
-          ticket: ticketPk,
-          buyer: wallet.publicKey,
-        })
-        .rpc();
-
-      return { signature: tx };
+      return {
+        signature: result.mintResult.signature,
+        ticketPublicKey: result.mintResult.mintAddress ?? result.mintResult.assetId,
+      };
     } catch (error) {
-      console.error('Error buying resale ticket:', error);
+      recordFailure('minting', {
+        error: error instanceof Error ? error : new Error(String(error)),
+        eventId: ticket.eventId,
+        ticketId,
+        userId: ticket.ownerId,
+        idempotencyKey: `mint:${ticketId}:${wallet.publicKey.toBase58()}`,
+        payload: {
+          eventId: ticket.eventId,
+          ownerWallet: wallet.publicKey.toBase58(),
+          ticketId,
+        },
+      });
       throw error;
     }
-  }, [program, wallet.publicKey]);
+  }, [ensureFulfillmentFinalized, wallet.publicKey]);
 
-  const scanTicket = useCallback(async (
-    eventPublicKey: string | PublicKey,
-    ticketPublicKey: string | PublicKey
-  ) => {
-    if (!program || !wallet.publicKey) {
-      throw new Error('Wallet not connected');
+  const fetchMyTickets = useCallback(async (): Promise<Ticket[]> => {
+    ensureSeedData();
+    const sessionUserId = auth.user?.id ?? null;
+    if (!sessionUserId) return [];
+
+    await reconcilePendingPurchases();
+
+    const events = getEvents();
+    return getTickets()
+      .filter((ticket) => ticket.ownerId === sessionUserId)
+      .map((ticket) => ({
+        ...ticket,
+        event: events.find((event) => event.id === ticket.eventId) ?? null,
+      }));
+  }, [auth.user?.id, reconcilePendingPurchases]);
+
+  const fetchTicket = useCallback(async (ticketId: string): Promise<Ticket | null> => {
+    ensureSeedData();
+    const ticket = getTickets().find((item) => item.id === ticketId);
+    if (!ticket) return null;
+    return {
+      ...ticket,
+      event: getEvents().find((event) => event.id === ticket.eventId) ?? null,
+    };
+  }, []);
+
+  const listTicketForResale = useCallback(async (ticketId: string, salePrice: number) => {
+    ensureSeedData();
+    if (!wallet.publicKey) {
+      throw new Error('Connect a wallet to resell tickets');
     }
-    try {
-      const eventPk = typeof eventPublicKey === 'string'
-        ? new PublicKey(eventPublicKey)
-        : eventPublicKey;
-      const ticketPk = typeof ticketPublicKey === 'string'
-        ? new PublicKey(ticketPublicKey)
-        : ticketPublicKey;
 
-      const tx = await program.methods
-        .scanTicket()
-        .accounts({
-          event: eventPk,
-          ticket: ticketPk,
-          scanner: wallet.publicKey,
-        })
-        .rpc();
-
-      return { signature: tx };
-    } catch (error) {
-      console.error('Error scanning ticket:', error);
-      throw error;
+    const sessionUserId = auth.user?.id ?? null;
+    if (!sessionUserId) {
+      throw new Error('Sign in to resell tickets');
     }
-  }, [program, wallet.publicKey]);
 
-  const addScanner = useCallback(async (
-    eventPublicKey: string | PublicKey,
-    scannerPublicKey: string | PublicKey
-  ) => {
-    if (!program || !wallet.publicKey) {
-      throw new Error('Wallet not connected');
+    const tickets = getTickets();
+    const ticket = tickets.find((item) => item.id === ticketId);
+    const event = getEvents().find((item) => item.id === ticket?.eventId);
+    if (!ticket || !event) {
+      throw new Error('Ticket not found');
     }
-    try {
-      const eventPk = typeof eventPublicKey === 'string'
-        ? new PublicKey(eventPublicKey)
-        : eventPublicKey;
-      const scannerPk = typeof scannerPublicKey === 'string'
-        ? new PublicKey        : scannerPublicKey;
+    const actor = resolveActorForEvent(event);
+    enforceKycGate(event, actor.user, 'transfer');
 
-      const tx = await program.methods
-        .addScanner(scannerPk)
-        .accounts({
-          event: eventPk,
-          organizer: wallet.publicKey,
-        })
-        .rpc();
+    const marketplaceResult = createResaleListing({
+      event,
+      ticket,
+      sellerId: actor.userId,
+      sellerWallet: wallet.publicKey.toBase58(),
+      salePrice,
+      marketplace: getMarketplaceState(),
+    });
 
-      return { signature: tx };
-    } catch (error) {
-      console.error('Error adding scanner:', error);
-      throw error;
+    saveTickets(
+      tickets.map((item) => (item.id === ticketId ? marketplaceResult.ticket : item)),
+    );
+    saveResaleListings(prependRecords(getResaleListings(), [marketplaceResult.listing]));
+    saveTransferAuditLog(
+      prependRecords(getTransferAuditLog(), marketplaceResult.auditRecords),
+    );
+    saveFraudFlags(marketplaceResult.fraudFlags);
+
+    return { signature: `resale_${ticketId}` };
+  }, [auth.user?.id, enforceKycGate, ensureAuthenticatedCheckoutSession, resolveActorForEvent, wallet.publicKey]);
+
+  const buyResaleTicket = useCallback(async (ticketId: string) => {
+    ensureSeedData();
+    const tickets = getTickets();
+    const ticket = tickets.find((item) => item.id === ticketId);
+    const event = getEvents().find((item) => item.id === ticket?.eventId);
+    const listing = getResaleListings().find(
+      (item) => item.ticketId === ticketId && item.status === 'active',
+    );
+    if (!ticket || !event || !listing) {
+      throw new Error('Resale listing not found');
     }
-  }, [program, wallet.publicKey]);
+    const actor = resolveActorForEvent(event);
+    enforceKycGate(event, actor.user, 'transfer');
 
-  const getTicketQRData = useCallback((ticketPublicKey: string) => {
+    const marketplaceResult = settleResalePurchase({
+      event,
+      ticket,
+      listing,
+      buyerId: actor.userId,
+      buyerWallet: actor.walletAddress,
+      marketplace: getMarketplaceState(),
+    });
+
+    saveTickets(
+      tickets.map((item) => (item.id === ticketId ? marketplaceResult.ticket : item)),
+    );
+    saveResaleListings(
+      getResaleListings().map((item) =>
+        item.id === listing.id ? marketplaceResult.listing : item,
+      ),
+    );
+    savePayoutSplits(prependRecords(getPayoutSplits(), marketplaceResult.payoutSplits));
+    saveTransferAuditLog(
+      prependRecords(getTransferAuditLog(), marketplaceResult.auditRecords),
+    );
+    saveFraudFlags(marketplaceResult.fraudFlags);
+
+    return { signature: `buy_resale_${ticketId}` };
+  }, [enforceKycGate, resolveActorForEvent, wallet.publicKey]);
+
+  const scanTicket = useCallback(async (eventId: string, ticketId: string) => {
+    ensureSeedData();
+    const tickets = getTickets();
+    const ticket = tickets.find((item) => item.id === ticketId && item.eventId === eventId);
+    const event = getEvents().find((item) => item.id === eventId);
+    if (!ticket || !event) {
+      throw new Error('Ticket not found');
+    }
+
+    const scanFraud = evaluateScanFraud({
+      event,
+      ticket,
+      scannerUserId: auth.user?.id ?? null,
+      auditLog: getTransferAuditLog(),
+    });
+
+    if (scanFraud.fraudFlags.length > 0) {
+      saveFraudFlags(prependRecords(getFraudFlags(), scanFraud.fraudFlags));
+      saveTransferAuditLog(prependRecords(getTransferAuditLog(), scanFraud.auditRecords));
+      return { signature: `scan_${ticketId}` };
+    }
+
+    saveTickets(
+      tickets.map((item) =>
+        item.id === ticketId && item.eventId === eventId
+          ? {
+              ...item,
+              status: 'scanned' as const,
+              lastScannedAt: Date.now(),
+            }
+          : item,
+      ),
+    );
+    return { signature: `scan_${ticketId}` };
+  }, [auth.user?.id]);
+
+  const addScanner = useCallback(async (eventId: string, scannerId: string) => {
+    ensureSeedData();
+    const normalizedScannerId = toScannerCredential(scannerId);
+    if (!normalizedScannerId) {
+      throw new Error('Scanner credential is required');
+    }
+    saveEvents(getEvents().map((event) => event.id === eventId ? {
+      ...event,
+      authorizedScanners: Array.from(new Set([...event.authorizedScanners, normalizedScannerId])),
+    } : event));
+    return { signature: `scanner_${eventId}` };
+  }, []);
+
+  const getTicketQRData = useCallback((ticketId: string) => {
+    ensureSeedData();
+    const ticket = getTickets().find((item) => item.id === ticketId);
+    if (!ticket) {
+      throw new Error('Ticket not found');
+    }
+
     return JSON.stringify({
       type: 'nfticket',
-      ticketId: ticketPublicKey,
-      timestamp: Date.now(),
+      version: 2,
+      ticketId,
+      eventId: ticket.eventId,
+      issuedAt: Date.now(),
     });
   }, []);
 
   const parseScannedQRData = useCallback((qrData: string) => {
     try {
       const parsed = JSON.parse(qrData);
-      if (parsed.type === 'nfticket' && parsed.ticketId) {
-        return {
-          ticketId: parsed.ticketId,
-          timestamp: parsed.timestamp,
-        };
-      }
-      return null;
+      return (
+        parsed.type === 'nfticket' &&
+        parsed.version === 2 &&
+        typeof parsed.ticketId === 'string' &&
+        typeof parsed.eventId === 'string' &&
+        typeof parsed.issuedAt === 'number'
+      ) ? parsed : null;
     } catch {
       return null;
     }
   }, []);
 
+  const fetchFailedFlows = useCallback(async (): Promise<FailedFlowRecord[]> => {
+    if (!auth.hasAdminAccess('operations')) {
+      throw new Error('Admin operations access is required');
+    }
+    return operations().listFailures();
+  }, [auth, operations]);
+
+  const fetchIncidentAlerts = useCallback(async (): Promise<IncidentAlertRecord[]> => {
+    if (!auth.hasAdminAccess('operations')) {
+      throw new Error('Admin operations access is required');
+    }
+    return operations().listAlerts();
+  }, [auth, operations]);
+
+  const replayFailedFlow = useCallback(async (failureId: string) => {
+    if (!auth.hasAdminAccess('operations')) {
+      throw new Error('Admin operations access is required');
+    }
+    const service = operations();
+    const failure = service.markReplaying(failureId);
+    if (failure.type === 'minting' && failure.ticketId) {
+      const ticket = getTickets().find((entry) => entry.id === failure.ticketId);
+      if (ticket?.ownerWallet) {
+        const fulfillmentService = createBrowserFulfillmentServices();
+        await fulfillmentService.retryTicketIssuance({
+          ticketId: failure.ticketId,
+          ownerWallet: ticket.ownerWallet,
+          metadata: {
+            eventName: failure.payload.eventId ?? ticket.eventId,
+            tierName: ticket.tierName,
+            venue: '',
+            startsAt: ticket.purchaseTime,
+          },
+        });
+      }
+    }
+    if (failure.type === 'payment' && failure.ticketId && failure.eventId) {
+      const order = getOrders().find((entry) => entry.ticketId === failure.ticketId);
+      if (order?.id) {
+        const paymentService = createPaymentService();
+        await paymentService.fulfillOrder(order.id, wallet.publicKey?.toBase58() ?? null);
+      }
+    }
+    return service.resolveFailure(failureId, 'Replay completed');
+  }, [auth, operations, wallet.publicKey]);
+
+  const resolveIncident = useCallback(async (failureId: string, resolutionNote?: string) => {
+    if (!auth.hasAdminAccess('operations')) {
+      throw new Error('Admin operations access is required');
+    }
+    return operations().resolveFailure(failureId, resolutionNote);
+  }, [auth, operations]);
+
   return {
-    program,
-    provider,
-    connected: !!wallet.publicKey,
+    connected: Boolean(wallet.publicKey),
     publicKey: wallet.publicKey,
+    activeUser: auth.user,
+    session: auth.session,
+    authMode: auth.authMode,
     fetchEvents,
     fetchMyEvents,
     createEvent,
+    purchaseTicket,
     mintTicket,
     fetchMyTickets,
     fetchTicket,
@@ -522,5 +1225,14 @@ export const useNfticket = () => {
     addScanner,
     getTicketQRData,
     parseScannedQRData,
+    requestMagicLink: auth.requestMagicLink,
+    consumeMagicLink: auth.consumeMagicLink,
+    requestAccountRecovery: auth.requestAccountRecovery,
+    signInWithWallet: auth.signInWithWallet,
+    linkWallet: auth.linkWallet,
+    fetchFailedFlows,
+    fetchIncidentAlerts,
+    replayFailedFlow,
+    resolveIncident,
   };
 };

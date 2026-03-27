@@ -1,0 +1,277 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EventStatus {
+  draft
+  published
+  archived
+  cancelled
+}
+
+enum NftMode {
+  compressed
+  metadata
+}
+
+enum AuthMode {
+  email
+  wallet
+  hybrid
+}
+
+enum OrderStatus {
+  pending
+  confirmed
+  failed
+  refunded
+  cancelled
+}
+
+enum PaymentRail {
+  stripe
+  sol
+  usdc
+}
+
+enum TicketStatus {
+  reserved
+  issued
+  minted
+  transferred
+  scanned
+  voided
+}
+
+enum PayoutStatus {
+  pending
+  scheduled
+  paid
+  failed
+  cancelled
+}
+
+enum ScanResult {
+  accepted
+  rejected
+  duplicate
+  manual_review
+}
+
+enum KycStatus {
+  not_required
+  pending
+  approved
+  rejected
+}
+
+enum UserRole {
+  buyer
+  provider
+  admin
+  platform
+}
+
+model UserIdentity {
+  id            String      @id
+  email         String?     @unique
+  emailVerified Boolean     @default(false)
+  displayName   String?
+  primaryWallet String?     @unique
+  wallets       String[]
+  authMode      AuthMode
+  role          UserRole
+  kycStatus     KycStatus   @default(not_required)
+  metadata      Json?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  events        Event[]
+  orders        Order[]
+  tickets       Ticket[]
+  sessions      Session[]
+
+  @@index([role, createdAt])
+  @@index([kycStatus, createdAt])
+}
+
+model Event {
+  id                   String      @id
+  organizerId          String
+  name                 String
+  description          String
+  venue                String
+  startsAt             DateTime
+  endsAt               DateTime?
+  timeZone             String
+  status               EventStatus
+  capacity             Int
+  nftMode              NftMode
+  acceptedPayments     PaymentRail[]
+  resaleEnabled        Boolean     @default(true)
+  resaleMaxTransfers   Int         @default(4)
+  resaleMinMultiplier  Float       @default(1)
+  resaleMaxMultiplier  Float       @default(1.5)
+  royaltyBasisPoints   Int         @default(1000)
+  resaleApprovalNeeded Boolean     @default(false)
+  authMode             AuthMode    @default(hybrid)
+  requireVerifiedEmail Boolean     @default(true)
+  requireWalletLink    Boolean     @default(false)
+  requireKyc           Boolean     @default(false)
+  authorizedScanners   String[]    @default([])
+  metadata             Json?
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+  organizer            UserIdentity @relation(fields: [organizerId], references: [id])
+  orders               Order[]
+  tickets              Ticket[]
+  payouts              Payout[]
+  scans                Scan[]
+  scanAttempts         ScanAttempt[]
+
+  @@index([organizerId, startsAt])
+  @@index([status, startsAt])
+}
+
+model Order {
+  id               String       @id
+  eventId          String
+  purchaserId      String
+  ticketId         String?
+  paymentRail      PaymentRail
+  amount           Decimal      @db.Decimal(18, 6)
+  currency         String
+  status           OrderStatus
+  paymentReference String?
+  idempotencyKey   String       @unique
+  metadata         Json?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  event            Event        @relation(fields: [eventId], references: [id])
+  purchaser        UserIdentity @relation(fields: [purchaserId], references: [id])
+  ticket           Ticket?
+  payouts          Payout[]
+
+  @@index([eventId, createdAt])
+  @@index([purchaserId, createdAt])
+  @@index([status, createdAt])
+  @@index([paymentReference])
+}
+
+model Ticket {
+  id            String       @id
+  eventId       String
+  orderId       String?      @unique
+  ownerId       String
+  inventoryKey  String
+  tierName      String
+  seatLabel     String?
+  faceValue     Decimal      @db.Decimal(18, 6)
+  currency      String
+  assetId       String?      @unique
+  nftMode       NftMode
+  status        TicketStatus
+  transferCount Int          @default(0)
+  metadata      Json?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  event         Event        @relation(fields: [eventId], references: [id])
+  order         Order?       @relation(fields: [orderId], references: [id])
+  owner         UserIdentity @relation(fields: [ownerId], references: [id])
+  scans         Scan[]
+  scanAttempts  ScanAttempt[]
+
+  @@index([eventId, status])
+  @@index([ownerId, createdAt])
+  @@index([inventoryKey])
+}
+
+model Payout {
+  id                String       @id
+  eventId           String
+  orderId           String?
+  beneficiaryUserId String?
+  beneficiaryWallet String?
+  amount            Decimal      @db.Decimal(18, 6)
+  currency          String
+  status            PayoutStatus
+  reason            String
+  payoutReference   String?
+  metadata          Json?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  event             Event        @relation(fields: [eventId], references: [id])
+  order             Order?       @relation(fields: [orderId], references: [id])
+
+  @@index([eventId, status, createdAt])
+  @@index([orderId])
+}
+
+model Scan {
+  id            String      @id
+  eventId       String
+  ticketId      String
+  scannerUserId String?
+  checkpoint    String
+  result        ScanResult
+  scannedAt     DateTime
+  notes         String?
+  metadata      Json?
+  event         Event       @relation(fields: [eventId], references: [id])
+  ticket        Ticket      @relation(fields: [ticketId], references: [id])
+
+  @@index([eventId, scannedAt])
+  @@index([ticketId, scannedAt])
+  @@index([scannerUserId, scannedAt])
+}
+
+model ScanAttempt {
+  id                String      @id
+  eventId           String?
+  ticketId          String?
+  scanId            String?
+  scannerUserId     String?
+  scannerLabel      String?
+  deviceFingerprint String
+  idempotencyKey    String      @unique
+  checkpoint        String
+  result            ScanResult
+  failureReason     String?
+  payload           Json
+  location          Json?
+  scannedAt         DateTime
+  createdAt         DateTime    @default(now())
+  metadata          Json?
+  event             Event?      @relation(fields: [eventId], references: [id])
+  ticket            Ticket?     @relation(fields: [ticketId], references: [id])
+
+  @@index([eventId, createdAt])
+  @@index([ticketId, createdAt])
+  @@index([scannerUserId, createdAt])
+  @@index([result, createdAt])
+}
+
+model AppState {
+  key       String   @id
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Session {
+  id        String   @id
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      UserIdentity @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([token])
+}

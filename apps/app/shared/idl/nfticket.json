@@ -1,0 +1,501 @@
+{
+  "version": "0.1.0",
+  "name": "nfticket",
+  "instructions": [
+    {
+      "name": "createEvent",
+      "accounts": [
+        {
+          "name": "event",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "organizer",
+          "isMut": true,
+          "isSigner": true
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "description",
+          "type": "string"
+        },
+        {
+          "name": "eventDate",
+          "type": "i64"
+        },
+        {
+          "name": "venue",
+          "type": "string"
+        },
+        {
+          "name": "tiers",
+          "type": {
+            "vec": {
+              "defined": "TicketTier"
+            }
+          }
+        },
+        {
+          "name": "resaleConfig",
+          "type": {
+            "defined": "ResaleConfig"
+          }
+        }
+      ]
+    },
+    {
+      "name": "mintTicket",
+      "accounts": [
+        {
+          "name": "event",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "ticket",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "buyer",
+          "isMut": true,
+          "isSigner": true
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        }
+      ],
+      "args": [
+        {
+          "name": "tierIndex",
+          "type": "u8"
+        },
+        {
+          "name": "seatInfo",
+          "type": {
+            "option": "string"
+          }
+        }
+      ]
+    },
+    {
+      "name": "listTicketForResale",
+      "accounts": [
+        {
+          "name": "event",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "ticket",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "seller",
+          "isMut": false,
+          "isSigner": true
+        }
+      ],
+      "args": [
+        {
+          "name": "salePrice",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "buyResaleTicket",
+      "accounts": [
+        {
+          "name": "event",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "ticket",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "buyer",
+          "isMut": false,
+          "isSigner": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "scanTicket",
+      "accounts": [
+        {
+          "name": "event",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "ticket",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "scanner",
+          "isMut": false,
+          "isSigner": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "addScanner",
+      "accounts": [
+        {
+          "name": "event",
+          "isMut": true,
+          "isSigner": false
+        },
+        {
+          "name": "organizer",
+          "isMut": false,
+          "isSigner": true
+        }
+      ],
+      "args": [
+        {
+          "name": "scanner",
+          "type": "publicKey"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Event",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "organizer",
+            "type": "publicKey"
+          },
+          {
+            "name": "name",
+            "type": "string"
+          },
+          {
+            "name": "description",
+            "type": "string"
+          },
+          {
+            "name": "eventDate",
+            "type": "i64"
+          },
+          {
+            "name": "venue",
+            "type": "string"
+          },
+          {
+            "name": "tiers",
+            "type": {
+              "vec": {
+                "defined": "TicketTier"
+              }
+            }
+          },
+          {
+            "name": "resaleConfig",
+            "type": {
+              "defined": "ResaleConfig"
+            }
+          },
+          {
+            "name": "isActive",
+            "type": "bool"
+          },
+          {
+            "name": "totalTicketsSold",
+            "type": "u32"
+          },
+          {
+            "name": "totalRevenue",
+            "type": "u64"
+          },
+          {
+            "name": "authorizedScanners",
+            "type": {
+              "vec": "publicKey"
+            }
+          },
+          {
+            "name": "createdAt",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Ticket",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventId",
+            "type": "publicKey"
+          },
+          {
+            "name": "owner",
+            "type": "publicKey"
+          },
+          {
+            "name": "tierIndex",
+            "type": "u8"
+          },
+          {
+            "name": "tierName",
+            "type": "string"
+          },
+          {
+            "name": "seatInfo",
+            "type": {
+              "option": "string"
+            }
+          },
+          {
+            "name": "purchasePrice",
+            "type": "u64"
+          },
+          {
+            "name": "purchaseTime",
+            "type": "i64"
+          },
+          {
+            "name": "scanStatus",
+            "type": {
+              "defined": "ScanStatus"
+            }
+          },
+          {
+            "name": "resaleCount",
+            "type": "u8"
+          },
+          {
+            "name": "resaleHistory",
+            "type": {
+              "vec": {
+                "defined": "ResaleRecord"
+              }
+            }
+          },
+          {
+            "name": "isForSale",
+            "type": "bool"
+          },
+          {
+            "name": "salePrice",
+            "type": {
+              "option": "u64"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "TicketTier",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "name",
+            "type": "string"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "supply",
+            "type": "u32"
+          },
+          {
+            "name": "sold",
+            "type": "u32"
+          },
+          {
+            "name": "benefits",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ResaleConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "timeDecayEnabled",
+            "type": "bool"
+          },
+          {
+            "name": "maxPremiumBps",
+            "type": "u16"
+          },
+          {
+            "name": "organizerRoyalty",
+            "type": "u8"
+          },
+          {
+            "name": "originalBuyerRoyalty",
+            "type": "u8"
+          },
+          {
+            "name": "charityRoyalty",
+            "type": "u8"
+          },
+          {
+            "name": "charityAddress",
+            "type": {
+              "option": "publicKey"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ScanStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Unscanned"
+          },
+          {
+            "name": "Scanned",
+            "fields": [
+              {
+                "name": "timestamp",
+                "type": "i64"
+              },
+              {
+                "name": "scanner",
+                "type": "publicKey"
+              }
+            ]
+          },
+          {
+            "name": "Invalidated"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ResaleRecord",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "from",
+            "type": "publicKey"
+          },
+          {
+            "name": "to",
+            "type": "publicKey"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "InvalidEventName",
+      "msg": "Invalid event name"
+    },
+    {
+      "code": 6001,
+      "name": "InvalidEventDate",
+      "msg": "Event date must be in the future"
+    },
+    {
+      "code": 6002,
+      "name": "NoTiersProvided",
+      "msg": "No ticket tiers provided"
+    },
+    {
+      "code": 6003,
+      "name": "EventNotActive",
+      "msg": "Event is not active"
+    },
+    {
+      "code": 6004,
+      "name": "InvalidTier",
+      "msg": "Invalid ticket tier"
+    },
+    {
+      "code": 6005,
+      "name": "TierSoldOut",
+      "msg": "Ticket tier sold out"
+    },
+    {
+      "code": 6006,
+      "name": "NotTicketOwner",
+      "msg": "Not the ticket owner"
+    },
+    {
+      "code": 6007,
+      "name": "TicketAlreadyUsed",
+      "msg": "Ticket already used"
+    },
+    {
+      "code": 6008,
+      "name": "PriceExceedsMaximum",
+      "msg": "Price exceeds maximum allowed"
+    },
+    {
+      "code": 6009,
+      "name": "TicketNotForSale",
+      "msg": "Ticket not for sale"
+    },
+    {
+      "code": 6010,
+      "name": "TicketEventMismatch",
+      "msg": "Ticket event mismatch"
+    },
+    {
+      "code": 6011,
+      "name": "UnauthorizedScanner",
+      "msg": "Unauthorized scanner"
+    },
+    {
+      "code": 6012,
+      "name": "ScannerAlreadyExists",
+      "msg": "Scanner already exists"
+    }
+  ],
+  "metadata": {
+    "address": "NFTicket111111111111111111111111111111111111"
+  }
+}

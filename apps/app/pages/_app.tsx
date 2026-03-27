@@ -2,12 +2,13 @@ import React, { useEffect } from 'react';
 import Head from 'next/head';
 import { ConnectionProvider, WalletProvider } from '@solana/wallet-adapter-react';
 import { WalletModalProvider } from '@solana/wallet-adapter-react-ui';
-import { PhantomWalletAdapter, SolflareWalletAdapter } from '@solana/wallet-adapter-wallets';
 import { clusterApiUrl } from '@solana/web3.js';
+import { HybridAuthProvider } from '../../shared/auth/HybridAuthContext';
+import { createWalletAdapters } from '../../shared/lib/mockWalletAdapter';
 import '@solana/wallet-adapter-react-ui/styles.css';
 import '../styles/globals.css';
 
-const wallets = [new PhantomWalletAdapter(), new SolflareWalletAdapter()];
+const wallets = createWalletAdapters();
 const endpoint = clusterApiUrl('devnet');
 
 export default function NFTicketApp({ Component, pageProps }) {
@@ -31,11 +32,13 @@ export default function NFTicketApp({ Component, pageProps }) {
         <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
       </Head>
       <ConnectionProvider endpoint={endpoint}>
-        <WalletProvider wallets={wallets} autoConnect>
+        <WalletProvider wallets={wallets}>
           <WalletModalProvider>
-            <div className="min-h-screen bg-black text-white">
-              <Component {...pageProps} />
-            </div>
+            <HybridAuthProvider>
+              <div className="min-h-screen bg-black text-white" suppressHydrationWarning>
+                <Component {...pageProps} />
+              </div>
+            </HybridAuthProvider>
           </WalletModalProvider>
         </WalletProvider>
       </ConnectionProvider>
